@@ -223,6 +223,27 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Integration mirrors no longer claim addresses another integration
+  owns (#1135).** Each mirror should skip an IP address another
+  integration already owns and warn "owned by another integration; not
+  claiming". The UniFi, OPNsense, Proxmox, Kubernetes, Docker,
+  Tailscale and Cloud mirrors each kept their own list of the other
+  integrations, and every list had fallen behind as integrations were
+  added: UniFi, for one, didn't know about OPNsense, the common homelab
+  pairing. A claimed address was also marked as edited by hand, so from
+  then on neither integration kept it current, neither removed it when
+  the host went away, and deleting either integration's target deleted
+  it. All mirrors now use one shared list, and a test fails if a new
+  integration's column is missing from it or if a guard anywhere lists
+  the columns by hand.
+  Block move had the same gap. It refused to move a block holding rows
+  owned by four integrations, but not by the other seven, whose
+  reconcilers then re-created the moved rows in the old space.
+  Addresses already claimed twice before this upgrade are not changed:
+  a claim can't be told apart from a real operator edit.
+  `docs/TROUBLESHOOTING.md` has a query that lists them and says how
+  to fix each one.
+
 - **ACME DNS-01 no longer times out on very large DNS groups
   (#1184).** Since #1111 a DNS agent receives a change with the next
   render of its whole bundle, and QA measured one render of a
