@@ -223,6 +223,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The change-report PDF answered 500 for an `until` near year 1,
+  and every 500 lost its request id (#1201).** With no `since`,
+  `GET /audit/export.pdf` defaulted it to `until` minus 30 days, which
+  raised `OverflowError` for any `until` in the first 30 days of year
+  1. The window now starts at the earliest representable instant. An
+  `until` that is before year 1 in UTC (`0001-01-01T00:00:00+05:00`)
+  is a 422, as it already was when sent as `since`. Separately, the
+  unhandled-exception handler read the request id from the client's
+  headers only, so a client that sent none got a 500 with no
+  `X-Request-ID`, and the log line and Diagnostics row said
+  `request_id: null`. It now uses the id the request was logged under
+  and returns it on the response.
+
 - **Integration mirrors no longer claim addresses another integration
   owns (#1135).** Each mirror should skip an IP address another
   integration already owns and warn "owned by another integration; not
