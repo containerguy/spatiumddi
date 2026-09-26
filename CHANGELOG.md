@@ -223,6 +223,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **ACME DNS-01 no longer times out on very large DNS groups
+  (#1184).** Since #1111 a DNS agent receives a change with the next
+  render of its whole bundle, and QA measured one render of a
+  1.09M-record group at about 30 s. The ACME TXT record's fixed 30 s
+  apply wait therefore failed intermittently: the certificate order
+  failed, or the acme-dns `/update` endpoint answered 504. The wait now
+  scales with the renders the target servers have stored. Renders share
+  one worker slot, so it waits for the render already running plus one
+  per server, from the slowest recent render, plus 10 s. It never goes
+  below 30 s, so smaller groups are unchanged, and it is capped at
+  5 minutes for the built-in certificate client. `/update` is capped at
+  55 s, because it waits inside an HTTP request and the web frontend
+  ends those at 60 s.
+
 - **Retrying a failed slot upgrade with the same image works again
   (#1183).** Every supervisor reported the version `2026.05.14.1`, a
   literal nothing ever updated, and the control plane read it to decide
