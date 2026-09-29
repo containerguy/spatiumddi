@@ -232,7 +232,13 @@ the formatter handles the rest.
   record-op path honoured them. Each rrset now carries its records' TTL; a
   record with none inherits the zone's, 0 stays 0, and records at one name
   and type that disagree resolve to the lowest, the same rule the control
-  plane applies to a record op's rrset, so the two paths agree. Separately,
+  plane applies to the rrset it ships with a record op, so against a current
+  control plane the two paths agree. (A pre-#773 control plane sends ops
+  without that rrset, and the op path's own fallback for a record with no
+  TTL is still 3600.) Zone names are now matched case-insensitively:
+  PowerDNS stores them lowercased, so a zone configured as `Case.Test` was
+  re-created on every reconcile after the first, answered 409, and was
+  skipped, which left its records unreconciled. Separately,
   a zone PowerDNS refused to create or patch was logged and skipped, so
   #882's apply status reported `ok` for a zone that was never served (also
   measured: a CNAME beside other data at one name, refused with 422,

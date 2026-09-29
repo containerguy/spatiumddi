@@ -231,3 +231,53 @@ def test_an_unreadable_payload_fails_the_apply(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(drv, "_load_or_generate_api_key", lambda: "k")
     with pytest.raises(RuntimeError, match="cannot read the rendered zones payload"):
         drv.swap_and_reload()
+
+
+def test_a_refused_key_keeps_pdns_reason_when_the_put_404s(tmp_path: Path, monkeypatch) -> None:
+    """pdns refuses a bad key with 422, the same status the driver reads as
+    "already present"; the follow-up PUT then 404s, and that must not be the
+    only reason reported."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/tsigkeys"):
+            return httpx.Response(422, json={"error": "invalid algorithm"})
+        if request.method == "PUT" and "/tsigkeys/" in request.url.path:
+            return httpx.Response(404, json={"error": "TSIG key not found"})
+        return _ok(request)
+
+    _api(monkeypatch, handler)
+    key = {"name": "ddns-key", "algorithm": "hmac-bogus", "secret": "c2VjcmV0"}
+    with pytest.raises(RuntimeError, match=r"HTTP 404 .*\(create: HTTP 422 invalid algorithm\)"):
+        PowerDNSDriver(state_dir=tmp_path)._reconcile_zones(
+            "k", [_zone("old.test.", update_tsig_keys=[key])]
+        )
+
+
+def test_a_key_shared_by_zones_is_imported_once(tmp_path: Path, monkeypatch) -> None:
+    seen = _api(monkeypatch, _ok)
+    key = {"name": "ddns-key", "algorithm": "hmac-sha256", "secret": "c2VjcmV0"}
+    PowerDNSDriver(state_dir=tmp_path)._reconcile_zones(
+        "k",
+        [
+            _zone("old.test.", update_tsig_keys=[key]),
+            _zone("new.test.", update_tsig_keys=[key]),
+        ],
+    )
+    assert sum(1 for r in seen if r.url.path.endswith("/tsigkeys")) == 1
+
+
+def test_a_zone_pdns_stored_lowercased_is_patched_not_recreated(tmp_path: Path, monkeypatch) -> None:
+    """PowerDNS stores zone names lowercased (verified). Comparing exactly
+    re-POSTed ``Case.Test.`` on every reconcile after the first, which answers
+    409 and would now fail every apply."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[{"name": "case.test."}])
+        if request.method == "POST":
+            return httpx.Response(409, json={"error": "Conflict"})
+        return _ok(request)
+
+    seen = _api(monkeypatch, handler)
+    PowerDNSDriver(state_dir=tmp_path)._reconcile_zones("k", [_zone("Case.Test.")])
+    assert not any(r.method == "POST" and r.url.path.endswith("/zones") for r in seen)
+    assert any(r.method == "PATCH" for r in seen)

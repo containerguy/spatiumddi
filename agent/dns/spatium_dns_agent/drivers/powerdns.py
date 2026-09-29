@@ -475,7 +475,10 @@ class PowerDNSDriver(DriverBase):
                 # (``_rrset_payload`` in backend/app/services/dns/rrset.py), so
                 # a full reconcile and an incremental write agree rather than
                 # flapping the served TTL between them.
-                log.warning(
+                # Info, not warning: a round-robin set whose members were given
+                # different TTLs is a legitimate configuration, and this fires on
+                # every render, so a warning would be permanent noise.
+                log.info(
                     "powerdns_rrset_ttl_mixed",
                     zone=zname,
                     count=len(mixed),
@@ -1338,6 +1341,11 @@ class PowerDNSDriver(DriverBase):
         """
         headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
         failures: list[str] = []
+        # TSIG keys already imported this pass. A group key is referenced by
+        # every zone that grants it, so importing it per zone cost two calls
+        # per zone and repeated one refusal once per zone, filling the
+        # five-failure summary with a single key and hiding the rest.
+        tsig_seen: set[str] = set()
         with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
             # Not knowing which zones exist is a failure, not an empty list:
             # an empty list sent every existing zone down the CREATE path,
@@ -1348,11 +1356,20 @@ class PowerDNSDriver(DriverBase):
                 existing = resp.json()
             except (httpx.HTTPError, ValueError) as exc:
                 raise RuntimeError(f"cannot list PowerDNS zones: {exc}") from exc
-            existing_names = {z["name"] for z in existing if isinstance(z, dict)}
+            # Compared case-insensitively, as DNS names are: PowerDNS stores a
+            # zone lowercased, so an exact match missed ``Case.Test.`` on every
+            # reconcile after the first and re-POSTed it, which answers 409.
+            # That used to be skipped silently (the zone's records then never
+            # updated through this path); now it would fail every apply.
+            # Verified against a real pdns, which also accepts either case in
+            # the PATCH URL.
+            existing_names = {
+                z["name"].lower() for z in existing if isinstance(z, dict) and z.get("name")
+            }
 
             for zone_payload in payload:
                 zone_name = zone_payload["name"]
-                if zone_name not in existing_names:
+                if zone_name.lower() not in existing_names:
                     # Create — POST /zones with the full rrset list.
                     create_body = {
                         "name": zone_name,
@@ -1419,7 +1436,9 @@ class PowerDNSDriver(DriverBase):
                 # Dynamic-update (RFC 2136) ACL metadata (issue #641).
                 failures.extend(
                     f"{zone_name} dynamic-update ACL: {problem}"
-                    for problem in self._apply_dynamic_update(client, headers, zone_payload)
+                    for problem in self._apply_dynamic_update(
+                        client, headers, zone_payload, tsig_seen=tsig_seen
+                    )
                 )
 
                 # LUA records are enabled globally via
@@ -1446,6 +1465,8 @@ class PowerDNSDriver(DriverBase):
         client: httpx.Client,
         headers: dict[str, str],
         zone_payload: dict[str, Any],
+        *,
+        tsig_seen: set[str] | None = None,
     ) -> list[str]:
         """Set (or clear) a zone's RFC 2136 dynamic-update metadata.
 
@@ -1458,6 +1479,9 @@ class PowerDNSDriver(DriverBase):
         after the other zones are done (#1225). This used to be best-effort,
         which meant a failed CLEAR left a zone accepting updates the operator
         had turned off while the apply reported ``ok``.
+
+        ``tsig_seen`` names keys already imported during this reconcile; they
+        are skipped here, and so is their outcome, which was reported once.
         """
         zone = zone_payload["name"]
         acl = zone_payload.get("update_acl") or []
@@ -1475,11 +1499,16 @@ class PowerDNSDriver(DriverBase):
             and e.get("match_kind") == "tsig_key"
             and e.get("tsig_key_name")
         ]
-        problems = [
-            problem
-            for k in zone_payload.get("update_tsig_keys") or []
-            if (problem := self._ensure_tsigkey(client, headers, k))
-        ]
+        problems: list[str] = []
+        for k in zone_payload.get("update_tsig_keys") or []:
+            key_name = (k.get("name") or "").rstrip(".")
+            if tsig_seen is not None:
+                if key_name in tsig_seen:
+                    continue
+                tsig_seen.add(key_name)
+            problem = self._ensure_tsigkey(client, headers, k)
+            if problem:
+                problems.append(problem)
         for kind, values in (
             ("ALLOW-DNSUPDATE-FROM", ip_from),
             ("TSIG-ALLOW-DNSUPDATE", key_names),
@@ -1504,8 +1533,9 @@ class PowerDNSDriver(DriverBase):
             "key": secret,
         }
         try:
-            resp = client.post(f"{_PDNS_API_BASE}/tsigkeys", headers=headers, json=body)
-            if resp.status_code in (409, 422):
+            post = client.post(f"{_PDNS_API_BASE}/tsigkeys", headers=headers, json=body)
+            resp = post
+            if post.status_code in (409, 422):
                 # Already present — PUT in case the secret rotated. pdns keys
                 # the TSIG key by its (dot-stripped) name, so no trailing dot.
                 resp = client.put(
@@ -1518,7 +1548,13 @@ class PowerDNSDriver(DriverBase):
                     status=resp.status_code,
                     body=resp.text[:200],
                 )
-                return f"TSIG key {name}: HTTP {resp.status_code} {_pdns_error(resp)}"
+                problem = f"TSIG key {name}: HTTP {resp.status_code} {_pdns_error(resp)}"
+                if resp is not post and post.status_code == 422:
+                    # A 422 is also how pdns refuses a key it will not store
+                    # (bad algorithm, bad secret); the PUT then answers 404
+                    # for a key that does not exist, which hides that reason.
+                    problem += f" (create: HTTP 422 {_pdns_error(post)})"
+                return problem
         except httpx.HTTPError as exc:
             log.warning("powerdns_tsigkey_import_error", key=name, error=str(exc))
             return f"TSIG key {name}: {exc}"
