@@ -202,6 +202,18 @@ def _dnsdist_cert_paths() -> tuple[str, str]:
 _SECRET_RENDERED_FILES: tuple[str, ...] = ("pdns.conf", "zones.json")
 
 
+def _pdns_error(resp: httpx.Response) -> str:
+    """PowerDNS's own error text for a refused call (``{"error": "..."}``),
+    or the start of the body when it is not JSON."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return resp.text[:150]
+    if isinstance(body, dict) and body.get("error"):
+        return str(body["error"])[:200]
+    return resp.text[:150]
+
+
 def _harden_legacy_rendered_modes(state_dir: Path) -> None:
     """Fix 0644 secret files left by a pre-#869 agent build.
 
@@ -434,6 +446,14 @@ class PowerDNSDriver(DriverBase):
                 and e.get("tsig_key_name") in bundle_keys
             ]
             rrsets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            # Each rrset's TTL from its own records (#1225). This path used to
+            # stamp the ZONE TTL on every rrset, so each structural reconcile
+            # (agent start, any structural change) REPLACEd every rrset at the
+            # zone default and PowerDNS served TTLs nobody configured, while
+            # the record-op path honoured them — the two disagreed.
+            zone_ttl = zone.get("ttl")
+            default_ttl = 3600 if zone_ttl is None else int(zone_ttl)
+            rrset_ttls: dict[tuple[str, str], list[int]] = {}
             for rec in zone.get("records") or []:
                 qname = _qualified_name(zname, rec.get("name") or "@")
                 rtype = rec["type"].upper()
@@ -442,6 +462,26 @@ class PowerDNSDriver(DriverBase):
                         "content": _record_content(rec),
                         "disabled": False,
                     }
+                )
+                # Absence, not falsiness: a TTL of 0 is legal ("do not cache").
+                rec_ttl = rec.get("ttl")
+                rrset_ttls.setdefault((qname, rtype), []).append(
+                    default_ttl if rec_ttl is None else int(rec_ttl)
+                )
+            mixed = sorted(k for k, ttls in rrset_ttls.items() if len(set(ttls)) > 1)
+            if mixed:
+                # RFC 2181: an rrset has ONE TTL. The lowest wins, the rule the
+                # control plane applies to the rrset it ships with a record op
+                # (``_rrset_payload`` in backend/app/services/dns/rrset.py), so
+                # a full reconcile and an incremental write agree rather than
+                # flapping the served TTL between them.
+                log.warning(
+                    "powerdns_rrset_ttl_mixed",
+                    zone=zname,
+                    count=len(mixed),
+                    sample=[f"{n} {t}" for n, t in mixed[:5]],
+                    detail="records at one name and type have different TTLs; "
+                    "the lowest is served for the whole rrset",
                 )
             zones_payload.append(
                 {
@@ -452,7 +492,7 @@ class PowerDNSDriver(DriverBase):
                         {
                             "name": qname,
                             "type": rtype,
-                            "ttl": zone.get("ttl", 3600),
+                            "ttl": min(rrset_ttls[(qname, rtype)]),
                             "records": rrs,
                         }
                         for (qname, rtype), rrs in sorted(rrsets.items())
@@ -622,15 +662,14 @@ class PowerDNSDriver(DriverBase):
             self._wait_for_api_up()
 
         api_key = self._load_or_generate_api_key()
+        # ``render()`` always writes zones.json, so a missing or unreadable one
+        # means the zones were NOT reconciled. That is a failed apply, not a
+        # warning: returning here used to report the apply OK (#1225).
         zones_path = current / "zones.json"
-        if not zones_path.exists():
-            log.warning("powerdns_zones_payload_missing")
-            return
         try:
             payload = json.loads(zones_path.read_text())
-        except Exception as exc:  # noqa: BLE001
-            log.error("powerdns_zones_payload_unreadable", error=str(exc))
-            return
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"cannot read the rendered zones payload: {exc}") from exc
 
         # Let HTTPError propagate — the sync loop catches the
         # exception, logs ``sync_apply_failed``, and crucially does
@@ -1290,13 +1329,25 @@ class PowerDNSDriver(DriverBase):
         should explicitly delete a zone, not have it disappear because
         a sync glitched). Phase 2 wires the explicit-delete signal
         from the bundle.
+
+        Every zone is attempted, so one PowerDNS rejects does not strand
+        the rest, and then any failure raises (#1225). A create or patch
+        PowerDNS refused used to be logged and skipped, so #882's apply
+        status reported ``ok`` for a zone that was never served and the
+        bundle was committed as last-known-good.
         """
         headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+        failures: list[str] = []
         with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+            # Not knowing which zones exist is a failure, not an empty list:
+            # an empty list sent every existing zone down the CREATE path,
+            # where PowerDNS answers 409, which was logged and skipped.
             try:
-                existing = client.get(f"{_PDNS_API_BASE}/zones", headers=headers).json()
-            except (httpx.HTTPError, ValueError):
-                existing = []
+                resp = client.get(f"{_PDNS_API_BASE}/zones", headers=headers)
+                resp.raise_for_status()
+                existing = resp.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                raise RuntimeError(f"cannot list PowerDNS zones: {exc}") from exc
             existing_names = {z["name"] for z in existing if isinstance(z, dict)}
 
             for zone_payload in payload:
@@ -1319,6 +1370,9 @@ class PowerDNSDriver(DriverBase):
                             zone=zone_name,
                             status=resp.status_code,
                             body=resp.text[:200],
+                        )
+                        failures.append(
+                            f"{zone_name} create: HTTP {resp.status_code} {_pdns_error(resp)}"
                         )
                         continue
                     log.info("powerdns_zone_created", zone=zone_name)
@@ -1351,6 +1405,10 @@ class PowerDNSDriver(DriverBase):
                                 status=resp.status_code,
                                 body=resp.text[:200],
                             )
+                            failures.append(
+                                f"{zone_name} update: HTTP {resp.status_code} "
+                                f"{_pdns_error(resp)}"
+                            )
                             continue
                         log.info(
                             "powerdns_zone_reconciled",
@@ -1359,7 +1417,10 @@ class PowerDNSDriver(DriverBase):
                         )
 
                 # Dynamic-update (RFC 2136) ACL metadata (issue #641).
-                self._apply_dynamic_update(client, headers, zone_payload)
+                failures.extend(
+                    f"{zone_name} dynamic-update ACL: {problem}"
+                    for problem in self._apply_dynamic_update(client, headers, zone_payload)
+                )
 
                 # LUA records are enabled globally via
                 # ``enable-lua-records=yes`` in pdns.conf (see
@@ -1372,6 +1433,12 @@ class PowerDNSDriver(DriverBase):
                 # bulk reconcile of a LUA-bearing zone. The global
                 # knob makes the per-zone PUT unnecessary.
 
+        if failures:
+            more = f" (and {len(failures) - 5} more)" if len(failures) > 5 else ""
+            raise RuntimeError(
+                "PowerDNS did not accept every zone: " + "; ".join(failures[:5]) + more
+            )
+
     # ── Dynamic-update ACLs (issue #641) ───────────────────────────────────
 
     def _apply_dynamic_update(
@@ -1379,14 +1446,18 @@ class PowerDNSDriver(DriverBase):
         client: httpx.Client,
         headers: dict[str, str],
         zone_payload: dict[str, Any],
-    ) -> None:
+    ) -> list[str]:
         """Set (or clear) a zone's RFC 2136 dynamic-update metadata.
 
         PowerDNS is coarse-only: ``ALLOW-DNSUPDATE-FROM`` (grant IP/CIDRs) +
         ``TSIG-ALLOW-DNSUPDATE`` (grant TSIG key names, imported first). An
         empty ACL clears both so a zone whose dynamic updates were turned off
-        stops accepting them. Best-effort — a failed call logs and moves on,
-        never aborting the reconcile.
+        stops accepting them.
+
+        Returns what PowerDNS refused, for the caller to fail the apply with
+        after the other zones are done (#1225). This used to be best-effort,
+        which meant a failed CLEAR left a zone accepting updates the operator
+        had turned off while the apply reported ``ok``.
         """
         zone = zone_payload["name"]
         acl = zone_payload.get("update_acl") or []
@@ -1404,19 +1475,29 @@ class PowerDNSDriver(DriverBase):
             and e.get("match_kind") == "tsig_key"
             and e.get("tsig_key_name")
         ]
-        for k in zone_payload.get("update_tsig_keys") or []:
-            self._ensure_tsigkey(client, headers, k)
-        self._put_metadata(client, headers, zone, "ALLOW-DNSUPDATE-FROM", ip_from)
-        self._put_metadata(client, headers, zone, "TSIG-ALLOW-DNSUPDATE", key_names)
+        problems = [
+            problem
+            for k in zone_payload.get("update_tsig_keys") or []
+            if (problem := self._ensure_tsigkey(client, headers, k))
+        ]
+        for kind, values in (
+            ("ALLOW-DNSUPDATE-FROM", ip_from),
+            ("TSIG-ALLOW-DNSUPDATE", key_names),
+        ):
+            problem = self._put_metadata(client, headers, zone, kind, values)
+            if problem:
+                problems.append(problem)
+        return problems
 
     def _ensure_tsigkey(
         self, client: httpx.Client, headers: dict[str, str], key: dict[str, Any]
-    ) -> None:
-        """Import a TSIG key into pdns (idempotent)."""
+    ) -> str | None:
+        """Import a TSIG key into pdns (idempotent). Returns what went wrong,
+        or None."""
         name = (key.get("name") or "").rstrip(".")
         secret = key.get("secret")
         if not name or not secret:
-            return
+            return None
         body = {
             "name": name,
             "algorithm": key.get("algorithm") or "hmac-sha256",
@@ -1427,18 +1508,21 @@ class PowerDNSDriver(DriverBase):
             if resp.status_code in (409, 422):
                 # Already present — PUT in case the secret rotated. pdns keys
                 # the TSIG key by its (dot-stripped) name, so no trailing dot.
-                client.put(
+                resp = client.put(
                     f"{_PDNS_API_BASE}/tsigkeys/{name}", headers=headers, json=body
                 )
-            elif resp.status_code >= 400:
+            if resp.status_code >= 400:
                 log.warning(
                     "powerdns_tsigkey_import_failed",
                     key=name,
                     status=resp.status_code,
                     body=resp.text[:200],
                 )
+                return f"TSIG key {name}: HTTP {resp.status_code} {_pdns_error(resp)}"
         except httpx.HTTPError as exc:
             log.warning("powerdns_tsigkey_import_error", key=name, error=str(exc))
+            return f"TSIG key {name}: {exc}"
+        return None
 
     def _put_metadata(
         self,
@@ -1447,8 +1531,9 @@ class PowerDNSDriver(DriverBase):
         zone: str,
         kind: str,
         values: list[str],
-    ) -> None:
-        """PUT (replace) or DELETE (when empty) a zone metadata kind."""
+    ) -> str | None:
+        """PUT (replace) or DELETE (when empty) a zone metadata kind.
+        Returns what went wrong, or None."""
         try:
             if values:
                 resp = client.put(
@@ -1469,8 +1554,11 @@ class PowerDNSDriver(DriverBase):
                     status=resp.status_code,
                     body=resp.text[:200],
                 )
+                return f"{kind}: HTTP {resp.status_code} {_pdns_error(resp)}"
         except httpx.HTTPError as exc:
             log.warning("powerdns_metadata_error", zone=zone, kind=kind, error=str(exc))
+            return f"{kind}: {exc}"
+        return None
 
     # ── Reload (compatibility with bind9 daemon-pid signal pattern) ────────
 
