@@ -1355,7 +1355,10 @@ the formatter handles the rest.
     such as an LDAP DN after an OU move, was re-attached by username and
     is now refused until an administrator links the account again. The
     link clears the stored identifier, and the next sign-in as that
-    username through that provider claims it.
+    username through that provider claims it; it also revokes the
+    account's sessions. Deleting a provider clears its accounts'
+    identifiers too, so a replacement provider of the same type that
+    issues the same `sub` or DN cannot adopt them.
 
 - **nmap `extra_args` are an allowlist, and a Network Editor can no longer
   read files through a scan (#1223).** The scan endpoint is gated on

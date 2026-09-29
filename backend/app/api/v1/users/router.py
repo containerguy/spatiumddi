@@ -392,7 +392,8 @@ async def link_provider(
     The link clears the stored external id: the next login through this
     provider with the account's username claims it and records the
     provider's id for the subject. Only this administrator action
-    authorises that username match.
+    authorises that username match. Every session the account holds is
+    revoked, so nothing opened under the previous identity survives it.
 
     A local account cannot be linked. It has a password, and linking it
     would hand it to whoever holds that username at the provider, which is
@@ -422,6 +423,15 @@ async def link_provider(
     user.auth_source = provider.type
     user.auth_provider_id = provider.id
     user.external_id = None
+    # The link changes who the account belongs to, and it is how an
+    # administrator repairs one a second provider signed in as before #1235.
+    # Sessions opened under the old identity must not outlive that, the
+    # same reasoning as the admin password reset above (#400).
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
+        .values(revoked=True)
+    )
     db.add(
         AuditLog(
             user_id=current_user.id,

@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
@@ -27,7 +28,7 @@ from app.core.auth.user_sync import (
 )
 from app.core.security import create_access_token, hash_password
 from app.models.audit import AuditLog
-from app.models.auth import Group, User
+from app.models.auth import Group, User, UserSession
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
 
 _MIGRATION = (
@@ -306,6 +307,61 @@ async def test_a_local_account_cannot_be_linked(
     assert resp.status_code == 422, resp.text
 
 
+async def test_the_link_revokes_the_accounts_sessions(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Re-linking is how an account a second provider signed in as gets
+    repaired; a session opened under the old identity must not survive it."""
+    group = await _group(db_session)
+    domain_a = await _provider(db_session, group)
+    await _provider(db_session, group)
+    legacy = await _legacy_user(db_session, auth_source="ldap", external_id="CN=jsmith,DC=a")
+    now = datetime.now(UTC)
+    session_row = UserSession(
+        user_id=legacy.id,
+        refresh_token_hash=uuid.uuid4().hex,
+        created_at=now,
+        expires_at=now + timedelta(days=1),
+    )
+    db_session.add(session_row)
+    headers = await _superadmin_headers(db_session)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/users/{legacy.id}/link-provider",
+        headers=headers,
+        json={"auth_provider_id": str(domain_a.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(session_row)
+    assert session_row.revoked is True
+
+
+async def test_a_deleted_providers_accounts_are_not_adopted_by_its_successor(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Deleting a provider orphans its accounts. A new provider of the same
+    type issuing the same ``sub`` is a different authority, so it must not
+    adopt one through the legacy path, even as the only provider of its type."""
+    group = await _group(db_session)
+    old_idp = await _provider(db_session, group, "oidc")
+    victim = await sync_external_user(db_session, old_idp, _subject("1"))
+    victim.is_superadmin = True
+    headers = await _superadmin_headers(db_session)
+    await db_session.commit()
+
+    resp = await client.delete(f"/api/v1/auth-providers/{old_idp.id}", headers=headers)
+    assert resp.status_code == 204, resp.text
+    await db_session.refresh(victim)
+    assert victim.auth_provider_id is None
+    assert victim.external_id is None
+
+    new_idp = await _provider(db_session, group, "oidc")
+    with pytest.raises(ExternalSyncRejected) as exc:
+        await sync_external_user(db_session, new_idp, _subject("1"))
+    assert exc.value.reason == "username_collision"
+
+
 # ── The migration's backfill ─────────────────────────────────────────────────
 
 
@@ -324,6 +380,7 @@ async def test_the_backfill_attributes_only_what_it_can_prove(db_session: AsyncS
     await _provider(db_session, group, "ldap")
     radius = await _provider(db_session, group, "radius")
     await _provider(db_session, group, "radius")
+    await _provider(db_session, group, "tacacs")  # the only TACACS+ provider
 
     def make(username: str, source: str, external_id: str | None) -> User:
         user = User(
@@ -340,16 +397,19 @@ async def test_the_backfill_attributes_only_what_it_can_prove(db_session: AsyncS
     oidc_user = make("o", "oidc", "sub-1")
     ldap_user = make("l", "ldap", "CN=l,DC=a")
     radius_user = make("r", "radius", f"{radius.id}:r")
+    orphan_tacacs = make("t", "tacacs", f"{uuid.uuid4()}:t")
     local_user = make("loc", "local", None)
     await db_session.flush()
 
     by_prefix, sole_provider = _backfill_sql()
     await db_session.execute(text(by_prefix))
     await db_session.execute(text(sole_provider))
-    for user in (oidc_user, ldap_user, radius_user, local_user):
+    for user in (oidc_user, ldap_user, radius_user, orphan_tacacs, local_user):
         await db_session.refresh(user)
 
     assert oidc_user.auth_provider_id == sole_oidc.id  # the only OIDC provider
     assert ldap_user.auth_provider_id is None  # two LDAP providers: cannot tell
     assert radius_user.auth_provider_id == radius.id  # named in its external id
+    # Names a provider that no longer exists: not handed to the sole TACACS+ one.
+    assert orphan_tacacs.auth_provider_id is None
     assert local_user.auth_provider_id is None

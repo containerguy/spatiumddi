@@ -84,7 +84,11 @@ async def _find_linked_user(
     3. an account from before the provider column (``auth_provider_id``
        NULL, same type, same external id), adopted only while this is the
        only provider of its type, so it cannot belong to another one.
-       Otherwise the login is refused until an administrator links it.
+       Otherwise the login is refused until an administrator links it. An
+       account whose provider was deleted also has NULL here, but deleting
+       the provider clears its ``external_id`` too, so it never matches
+       this step: a new provider issuing the same identifier is not the
+       same authority.
 
     An account is never adopted by username alone, whatever its type.
     """

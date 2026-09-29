@@ -17,7 +17,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, SuperAdmin
@@ -29,7 +29,7 @@ from app.core.auth.saml import probe_metadata as saml_probe_metadata
 from app.core.auth.tacacs import test_connection as tacacs_test_connection
 from app.core.crypto import decrypt_dict, encrypt_dict
 from app.models.audit import AuditLog
-from app.models.auth import Group
+from app.models.auth import Group, User
 from app.models.auth_provider import (
     PROVIDER_TYPES,
     AuthGroupMapping,
@@ -293,6 +293,20 @@ async def update_provider(
 @router.delete("/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_provider(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     provider = await _get_provider_or_404(db, provider_id)
+    # Its accounts lose their provider (the FK is SET NULL) and, with it,
+    # their identifier (#1235). An external id means something only at the
+    # provider that issued it; kept, it would let the next provider of this
+    # type adopt the account through the legacy path in ``user_sync`` by
+    # issuing the same ``sub`` / DN / NameID. The accounts are refused at
+    # sign-in until an administrator links them to a provider.
+    orphaned = (
+        await db.execute(
+            update(User)
+            .where(User.auth_provider_id == provider.id)
+            .values(external_id=None)
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
     db.add(
         AuditLog(
             user_id=user.id,
@@ -303,6 +317,7 @@ async def delete_provider(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
             resource_id=str(provider.id),
             resource_display=provider.name,
             result="success",
+            new_value={"accounts_unlinked": orphaned},
         )
     )
     await db.delete(provider)

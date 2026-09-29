@@ -272,7 +272,10 @@ function ProviderLink({ user }: { user: AppUser }) {
       setError(typeof msg === "string" ? msg : JSON.stringify(msg));
     },
   });
-  const current = providers.data?.find((p) => p.id === user.auth_provider_id);
+  // ``user`` is the modal's snapshot, so after a link read the provider
+  // from the response rather than reporting the account still unlinked.
+  const linkedId = link.data?.auth_provider_id ?? user.auth_provider_id;
+  const current = providers.data?.find((p) => p.id === linkedId);
 
   return (
     <div className="space-y-2 rounded-md border p-3">

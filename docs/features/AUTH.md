@@ -140,7 +140,10 @@ a user whose identifier at the provider changed — an LDAP DN after an OU
 move — is refused until an administrator links the account again from
 **Users → Edit → Sign-in provider**. Linking clears the stored identifier,
 and the next sign-in through that provider as the account's username claims
-it. A local account cannot be linked: it has a password, and linking it
+it; the link also revokes every session the account holds. Deleting a
+provider clears its accounts' identifiers as well as their provider, so a
+new provider of the same type issuing the same `sub` / DN never adopts one
+— they wait for an administrator's link. A local account cannot be linked: it has a password, and linking it
 would hand it to whoever holds the same username at the provider. The
 upgrade attributes existing accounts where it can prove the provider (a
 RADIUS / TACACS+ external id names it; an LDAP / OIDC / SAML account is

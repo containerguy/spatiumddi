@@ -10,7 +10,8 @@ Backfill, best effort and never guessing:
 * RADIUS / TACACS+ accounts carry their provider in the external id
   (``<provider id>:<username>``), so they are attributed exactly.
 * An LDAP / OIDC / SAML account is attributed when exactly one provider of
-  its type exists. With two or more there is no way to tell which one it
+  its type exists. A RADIUS / TACACS+ account whose prefix names no
+  existing provider is left NULL rather than given to the survivor. With two or more there is no way to tell which one it
   came from, so it stays NULL and the next login through either is refused
   until an administrator links it (``POST /users/{id}/link-provider``).
 
@@ -47,13 +48,16 @@ BACKFILL_BY_PREFIX = """
 """
 
 # Every other external type: only when exactly one provider of the type
-# exists, so the account cannot have come from another one.
+# exists, so the account cannot have come from another one. RADIUS /
+# TACACS+ are excluded: their external id names the provider, so one the
+# prefix pass did not attribute came from a provider that no longer exists,
+# and the sole survivor is exactly the guess this backfill refuses to make.
 BACKFILL_SOLE_PROVIDER = """
     UPDATE "user" u
        SET auth_provider_id = p.id
       FROM auth_provider p
      WHERE u.auth_provider_id IS NULL
-       AND u.auth_source <> 'local'
+       AND u.auth_source NOT IN ('local', 'radius', 'tacacs')
        AND u.external_id IS NOT NULL
        AND p.type = u.auth_source
        AND (SELECT count(*) FROM auth_provider q WHERE q.type = u.auth_source) = 1
