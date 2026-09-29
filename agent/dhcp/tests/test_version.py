@@ -33,3 +33,9 @@ def test_the_version_is_the_build_stamp(monkeypatch: pytest.MonkeyPatch, stamp: 
 @pytest.mark.parametrize("stamp", [None, "", "   "])
 def test_an_unstamped_build_reports_dev(monkeypatch: pytest.MonkeyPatch, stamp: str | None) -> None:
     assert _version_with(monkeypatch, stamp) == "dev"
+
+
+def test_the_version_fits_what_the_control_plane_accepts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register and heartbeat take at most 64 characters; a longer stamp
+    would be refused on every call."""
+    assert _version_with(monkeypatch, "1.0.0-" + "x" * 100) == ("1.0.0-" + "x" * 100)[:64]

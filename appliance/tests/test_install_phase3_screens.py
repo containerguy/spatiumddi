@@ -271,7 +271,8 @@ def test_the_build_date_comes_from_build_time_not_the_version(tmp_path, version)
 
 
 def test_a_stamp_without_build_time_falls_back_to_its_mtime(tmp_path):
-    """A local build writes no BUILD_TIME; the file's mtime is the build."""
+    """A stamp written by hand or by an older build carries no BUILD_TIME;
+    the file's mtime is the build."""
     got = _iso_build_date(tmp_path, 'APPLIANCE_VERSION="dev"\n')
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", got), got
 

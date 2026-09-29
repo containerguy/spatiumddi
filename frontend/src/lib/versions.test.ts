@@ -188,4 +188,13 @@ describe("helmChartVersion", () => {
     expect(helmChartVersion("latest")).toBeNull();
     expect(helmChartVersion("0.0.0-nightly-20261110+abc")).toBeNull();
   });
+
+  it("is null for a release string no tag could carry, so no chart exists", () => {
+    // parseRelease accepts all of these; release.yml refuses them as tags.
+    expect(helmChartVersion("2026.09.04")).toBeNull();
+    expect(helmChartVersion("1.0.0+abc")).toBeNull();
+    expect(helmChartVersion("01.0.0")).toBeNull();
+    expect(helmChartVersion("1.0.0-rc.01")).toBeNull();
+    expect(helmChartVersion("2026.9.4")).toBeNull();
+  });
 });

@@ -5892,31 +5892,6 @@ function ApplianceOsUpgradeSection({
               />
             </div>
           )}
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => scheduleUpgrade.mutate()}
-              disabled={
-                !tag.trim() ||
-                scheduleUpgrade.isPending ||
-                (sourceKind === "url" && !imageUrl.trim()) ||
-                (sourceKind === "uploaded" && !slotImageId)
-              }
-              className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {scheduleUpgrade.isPending ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <HardDrive className="h-3.5 w-3.5" />
-              )}
-              Schedule OS upgrade
-            </button>
-            {scheduleUpgrade.error && (
-              <span className="text-xs text-rose-700 dark:text-rose-300">
-                {formatApiError(scheduleUpgrade.error)}
-              </span>
-            )}
-          </div>
           {(direction === "backward" || direction === "same") && (
             <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1 text-[11px] text-amber-800 dark:text-amber-300">
               {direction === "backward" ? (
@@ -5935,6 +5910,33 @@ function ApplianceOsUpgradeSection({
               )}
             </p>
           )}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => scheduleUpgrade.mutate()}
+              disabled={
+                !tag.trim() ||
+                scheduleUpgrade.isPending ||
+                (sourceKind === "url" && !imageUrl.trim()) ||
+                (sourceKind === "uploaded" && !slotImageId)
+              }
+              className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {scheduleUpgrade.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <HardDrive className="h-3.5 w-3.5" />
+              )}
+              {direction === "backward"
+                ? "Schedule rollback"
+                : "Schedule OS upgrade"}
+            </button>
+            {scheduleUpgrade.error && (
+              <span className="text-xs text-rose-700 dark:text-rose-300">
+                {formatApiError(scheduleUpgrade.error)}
+              </span>
+            )}
+          </div>
           <p className="text-[11px] text-muted-foreground">
             Stamps <code>desired_appliance_version</code> on the appliance row.
             The supervisor reads it on its next heartbeat + writes the

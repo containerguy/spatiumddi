@@ -453,9 +453,10 @@ Press OK to begin, or Cancel to drop to a shell."
 #
 # Read from BUILD_TIME, which the build writes beside APPLIANCE_VERSION,
 # and not from the version: that stopped being a date at 1.0.0 (#1182), and
-# was never one on a dev build. A stamp with no BUILD_TIME (a local build)
-# falls back to the file's own mtime, which mkosi sets at build time and
-# nothing on the live ISO rewrites.
+# was never one on a dev build. Both CI and ``make appliance-stamp-dev``
+# write BUILD_TIME; a stamp without it (one written by hand, or by an older
+# build) falls back to the file's own mtime, which mkosi sets at build time
+# and nothing on the live ISO rewrites.
 _iso_build_date() {
     local f="${1:-/etc/spatiumddi/appliance-release}" t=""
     if [ -r "$f" ]; then
