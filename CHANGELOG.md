@@ -336,6 +336,24 @@ the formatter handles the rest.
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
 
+- **With New-device watch on, a DHCP lease batch that grants and releases
+  the same address is no longer lost (#1172).** With the watch on, the
+  lease-events endpoint records a MAC sighting for each active lease after
+  the IPAM mirror pass. When the same batch also released, expired or
+  declined that address, the pass had already deleted its IPAM row, so the
+  sighting's insert failed its foreign key. The loop caught the error
+  without a savepoint, the transaction stayed aborted, and the whole batch
+  was lost: its leases, IPAM mirror changes, DDNS changes and dedupe
+  receipt. The agent was answered 200 and did not resend, or 500 when the
+  batch had changed DNS records, which it resent unchanged until its spool
+  quarantined the batch while newer lease events waited behind it. The
+  agent batches every 5 seconds and re-reads its whole lease file on every
+  start, so ordinary churn and any agent restart could trigger it. A
+  sighting is now skipped when the same batch deleted its row, each
+  sighting runs in its own savepoint so one that fails rolls back only
+  itself, and the `device.first_seen` audit rows are written after the
+  last sighting, so none is published before the batch commits.
+
 - **The version-pin check now sees the Alpine-packaged daemons, and
   no longer reports a pin as behind when it is ahead (#1240).**
   BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
