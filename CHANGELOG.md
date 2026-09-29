@@ -1315,6 +1315,19 @@ the formatter handles the rest.
 
 ### Security
 
+- **Pinned images brought current; the CloudNativePG operator and
+  Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with
+  the CI gate (HIGH/CRITICAL, fixes available): the CloudNativePG
+  operator image 1.30.0, which the appliance bakes for an air-gapped
+  install, had 13, and 1.30.1 has none; `quay.io/coreos/etcd` v3.5.33
+  in the compose HA overlay had 10, and v3.5.34 has none. Also moved:
+  the CloudNativePG chart 0.29.0 -> 0.29.1 (it carries that operator),
+  nginx 1.31.5 -> 1.31.6 (frontend and the appliance landing page),
+  and redis 8.10.1 -> 8.10.2. Two pins are held for the 1.0 freeze,
+  each with its reason in `versions.json`: k3s v1.37 is a Kubernetes
+  minor that a slot revert cannot undo, and Technitium 15.5 is a minor
+  release.
+
 - **BIND is raised to 9.20.29-r0 in the DNS images (#1218).** The
   released 2026.09.04-1 `dns-bind9` image carries BIND 9.20.26, which
   has seven HIGH remote denial-of-service CVEs, all fixed in 9.20.29-r0:
