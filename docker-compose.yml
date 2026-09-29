@@ -244,7 +244,6 @@ services:
       SERVER_NAME: dns-bind9
       AGENT_GROUP: default
       AGENT_ROLES: authoritative
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
       - dns_bind9_state:/var/lib/spatium-dns-agent
       - dns_bind9_cache:/var/cache/bind
@@ -278,7 +277,6 @@ services:
       SERVER_NAME: dns-powerdns
       AGENT_GROUP: default-powerdns
       AGENT_ROLES: authoritative
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
       - dns_powerdns_state:/var/lib/spatium-dns-agent
       - dns_powerdns_lmdb:/var/lib/powerdns
@@ -310,7 +308,6 @@ services:
       SERVER_NAME: dns-technitium
       AGENT_GROUP: default-technitium
       AGENT_ROLES: authoritative
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
       - dns_technitium_state:/var/lib/spatium-dns-agent
       - dns_technitium_config:/etc/dns
@@ -385,8 +382,6 @@ services:
       AGENT_ROLES: primary
 
       # ── TLS ───────────────────────────────────────────────────────
-      # Skip TLS verify for self-signed control planes. Lab-only.
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
       # Path to a CA bundle (in-container) for private CA verification.
       # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
 
@@ -448,9 +443,6 @@ services:
       AGENT_GROUP: default
       AGENT_ROLES: secondary
 
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
-      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
-
       # Tuning (see dhcp-kea above for the full list).
       # LOG_LEVEL: INFO
       # HEARTBEAT_INTERVAL: "30"
@@ -495,10 +487,6 @@ services:
       # ── Registration ──────────────────────────────────────────────
       # Collector name (LookingGlassCollector row); unique per collector.
       SERVER_NAME: ${LG_HOSTNAME:-looking-glass}
-
-      # ── TLS ───────────────────────────────────────────────────────
-      # Loopback to the same-host API — TLS verify off is fine.
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
 
       # ── Tuning (optional, defaults shown) ─────────────────────────
       # LOG_LEVEL: INFO

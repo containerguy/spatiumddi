@@ -261,7 +261,6 @@ services:
       SERVER_NAME: dns-bind9
       AGENT_GROUP: default
       AGENT_ROLES: authoritative
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
       - dns_bind9_state:/var/lib/spatium-dns-agent
       - dns_bind9_cache:/var/cache/bind
@@ -298,7 +297,6 @@ services:
       SERVER_NAME: dns-powerdns
       AGENT_GROUP: default-powerdns
       AGENT_ROLES: authoritative
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
       - dns_powerdns_state:/var/lib/spatium-dns-agent
       - dns_powerdns_lmdb:/var/lib/powerdns
@@ -365,10 +363,6 @@ services:
       # Informational only — actual HA role is driven by channel membership.
       AGENT_ROLES: primary
 
-      # ── TLS ───────────────────────────────────────────────────────
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
-      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
-
       # ── Tuning (optional, defaults shown) ─────────────────────────
       # LOG_LEVEL: INFO             # DEBUG | INFO | WARNING | ERROR
       # HEARTBEAT_INTERVAL: "30"    # seconds between agent heartbeats
@@ -426,9 +420,6 @@ services:
       AGENT_GROUP: default
       AGENT_ROLES: secondary
 
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
-      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
-
       # Tuning (see dhcp-kea above for the full list).
       # LOG_LEVEL: INFO
       # HEARTBEAT_INTERVAL: "30"
@@ -468,8 +459,6 @@ services:
       LG_AGENT_KEY: ${LG_AGENT_KEY:-changeme-lg-agent-key}
       # ── Registration ──────────────────────────────────────────────
       SERVER_NAME: ${LG_HOSTNAME:-looking-glass}
-      # ── TLS ───────────────────────────────────────────────────────
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
       # ── Tuning (optional, defaults shown) ─────────────────────────
       # LOG_LEVEL: INFO
       # HEARTBEAT_INTERVAL: "30"
