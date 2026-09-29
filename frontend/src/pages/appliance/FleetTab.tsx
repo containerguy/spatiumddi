@@ -51,7 +51,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
-import { releaseVerdict } from "@/lib/versions";
+import { releaseVerdict, upgradeDirection } from "@/lib/versions";
 import {
   formatEta,
   formatMdLevel,
@@ -5690,6 +5690,11 @@ function ApplianceOsUpgradeSection({
       setSlotImageId("");
     },
   });
+  // #1182 — which way the typed target moves this node. Never blocked: this
+  // form is also how an operator rolls a node back by hand. But a backward
+  // move boots older code against a database the newer release may already
+  // have migrated (#1227), so say so before it is sent.
+  const direction = upgradeDirection(row.installed_appliance_version, tag);
   const clearUpgrade = useMutation({
     mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
@@ -5876,7 +5881,7 @@ function ApplianceOsUpgradeSection({
               <input
                 value={tag}
                 onChange={(e) => setTag(e.target.value)}
-                placeholder="target version (e.g. 2026.06.01-1)"
+                placeholder="target version (e.g. 1.0.0)"
                 className="flex-1 rounded-md border bg-background px-2 py-1 text-xs"
               />
               <input
@@ -5912,6 +5917,24 @@ function ApplianceOsUpgradeSection({
               </span>
             )}
           </div>
+          {(direction === "backward" || direction === "same") && (
+            <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1 text-[11px] text-amber-800 dark:text-amber-300">
+              {direction === "backward" ? (
+                <>
+                  <strong>{tag.trim()}</strong> is older than the installed{" "}
+                  <strong>{row.installed_appliance_version}</strong>: this is a
+                  rollback, not an upgrade. The older release boots against a
+                  database the newer one may already have migrated.
+                </>
+              ) : (
+                <>
+                  This node already runs <strong>{tag.trim()}</strong>. It will
+                  re-write the inactive slot with the same release and reboot
+                  into it.
+                </>
+              )}
+            </p>
+          )}
           <p className="text-[11px] text-muted-foreground">
             Stamps <code>desired_appliance_version</code> on the appliance row.
             The supervisor reads it on its next heartbeat + writes the

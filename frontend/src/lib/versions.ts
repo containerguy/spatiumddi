@@ -155,3 +155,49 @@ export function releaseVerdict(
   }
   return null;
 }
+
+/**
+ * The Helm chart version a release tag is published as, or null when `tag`
+ * is not a release. Helm requires strict SemVer, which forbids leading
+ * zeros, so a CalVer tag drops them (2026.04.20-1 is chart 2026.4.20-1); a
+ * SemVer tag is published unchanged. Mirrors chart_version() in
+ * scripts/release_version.py, which the release workflow publishes with.
+ *
+ * Every CalVer chart is a SemVer pre-release (the -N), and Helm's
+ * unversioned resolution skips pre-releases, so a helm command for a CalVer
+ * release must pass --version or Helm finds nothing (#1182).
+ */
+export function helmChartVersion(tag: string): string | null {
+  const release = parseRelease(tag);
+  if (release === null) return null;
+  if (release.scheme === "semver") return tag.trim();
+  const [year, month, day, n] = release.parts;
+  return `${year}.${month}.${day}-${n}`;
+}
+
+export type UpgradeDirection = "forward" | "same" | "backward" | "unknown";
+
+/**
+ * Whether moving a node from `installed` to `target` goes forward. Mirrors
+ * upgrade_direction() in backend/app/core/versions.py.
+ *
+ * "backward" covers a nightly that already includes the target: installing
+ * the release would drop whatever main gained since. "unknown" covers a
+ * target that is not a release, and an installed build whose relation to it
+ * cannot be known (a dev build, or a nightly on the tag's own day).
+ */
+export function upgradeDirection(
+  installed: string | null | undefined,
+  target: string | null | undefined,
+): UpgradeDirection {
+  const to = parseRelease(target);
+  if (to === null) return "unknown";
+  const from = parseRelease(installed);
+  if (from !== null) {
+    const cmp = compareReleases(to, from);
+    return cmp > 0 ? "forward" : cmp === 0 ? "same" : "backward";
+  }
+  const includes = includesRelease(installed, (target ?? "").trim());
+  if (includes === null) return "unknown";
+  return includes ? "backward" : "forward";
+}
