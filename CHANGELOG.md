@@ -336,6 +336,27 @@ the formatter handles the rest.
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
 
+- **A join the seed's etcd refuses is rolled back with its reason,
+  instead of sitting `joining` for good (#1285).** The join runner's
+  #1052 guard, which stops a node that already joined the seed's etcd
+  from being rolled back into a ghost voter, counted k3s's `Adding
+  member … to etcd cluster` line as membership. k3s logs that line
+  before it asks etcd to add the member, and again on every retry
+  while etcd refuses the add (`etcdserver: unhealthy cluster` while a
+  dead voter still holds a seat, for example). So a refused join was
+  kept: no rollback, k3s restarting every ~15 minutes, and a `failed`
+  no supervisor could report, so the row read `joining` indefinitely
+  and Replace refused it. Only lines k3s and etcd log after the add
+  succeeded count now. A refused join is rolled back to the node's
+  standalone control plane, with a reason that names the refusal
+  rather than an unreachable seed. When the refusal is a voter the
+  seed cannot reach, the node stays standalone: the reason says to
+  remove that member first, and the join is not retried on its own,
+  since every retry would wipe the node again and be refused again.
+  A learner backlog is still retried. The journal scan behind this
+  decision is also anchored in UTC, so an appliance set to another
+  time zone no longer scans the wrong window.
+
 - **The version-pin check now sees the Alpine-packaged daemons, and
   no longer reports a pin as behind when it is ahead (#1240).**
   BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and

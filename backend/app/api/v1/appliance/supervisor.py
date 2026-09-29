@@ -170,14 +170,21 @@ _PERMANENT_JOIN_FAILURE_MARKERS = (
     # "this node's etcd member was removed from the cluster — it must re-join
     # as a NEW member (leave first)"
     "must re-join as a new member",
+    # #1285 — "the seed's etcd refused this member (etcdserver: unhealthy
+    # cluster): a voting member it cannot reach still holds a seat — remove
+    # that member (Fleet → Replace), then retry". Every add is refused until
+    # that member is gone, and each retry wipes the node's identity again
+    # (observed: a re-fire 82 s after the rollback re-entered the refusal).
+    "a voting member it cannot reach",
 )
 
 
 def _join_failure_is_permanent(reason: str | None) -> bool:
     """PURE: a join failure an automatic retry cannot fix — a stale etcd
-    member under this hostname, a bootstrap-token mismatch on disk, or an
-    etcd member the cluster has permanently removed. All three need an
-    operator to evict, re-pair or leave first.
+    member under this hostname, a bootstrap-token mismatch on disk, an etcd
+    member the cluster has permanently removed, or a member add the seed's
+    etcd refuses because a voter it cannot reach still holds a seat (#1285).
+    All four need an operator to evict, re-pair or leave first.
 
     Everything else — the seed unreachable while it adds a learner, a
     readiness timeout, an unclassified k3s exit — is treated as transient
