@@ -1330,6 +1330,33 @@ the formatter handles the rest.
 
 ### Security
 
+- **A second provider of the same type can no longer sign in as another
+  provider's user (#1235).** External accounts were matched on
+  `(auth_source, external_id)`, and `auth_source` is the provider's
+  type, not the provider. On a miss, an account of the same type with
+  the same username was adopted. So with two LDAP domains or two OIDC
+  IdPs configured, whoever held `jsmith` in the second one signed in as
+  the first one's `jsmith`, superadmin flag and all; an identical OIDC
+  `sub` from two IdPs did the same without any username at all. Now an
+  external account belongs to one provider (`user.auth_provider_id`,
+  migration `f4a8c2e71d09`), a login matches on the provider and its
+  external id, and **an account is never adopted by username alone**:
+  a taken username is refused as `username_collision`.
+  - **Upgrade note.** The migration attributes existing accounts only
+    where it can prove the provider: RADIUS / TACACS+ external ids name
+    it, and an LDAP / OIDC / SAML account is attributed when its type has
+    exactly one provider. With two or more, an account is left unlinked
+    and is refused (`account_link_required`) until an administrator links
+    it from **Users → Edit → Sign-in provider**
+    (`POST /users/{id}/link-provider`, audited as
+    `user.provider_linked`). The Users page marks those accounts
+    **unlinked**, and `list_users` reports their provider as null.
+  - **Behaviour change.** A user whose identifier at the provider changes,
+    such as an LDAP DN after an OU move, was re-attached by username and
+    is now refused until an administrator links the account again. The
+    link clears the stored identifier, and the next sign-in as that
+    username through that provider claims it.
+
 - **nmap `extra_args` are an allowlist, and a Network Editor can no longer
   read files through a scan (#1223).** The scan endpoint is gated on
   `manage_nmap_scans`, which the builtin Network Editor role holds, and
