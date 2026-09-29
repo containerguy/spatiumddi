@@ -223,6 +223,30 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A BIND9 apply is reported OK only once named is actually serving it
+  (#1224, #1239).** Validation ran `named-checkconf`, which never reads zone
+  files, and returned success outright if the checker was missing; and
+  `rndc reload <zone>` only *queues* the load and exits 0 even for a file
+  named cannot parse (verified against BIND 9.20). So a zone with a bad
+  record kept serving its old copy, or SERVFAILed if it was new, while the
+  apply reported `ok` and committed the bundle as last-known-good, which
+  left #882's revert nothing to revert to. Three more holes in the same
+  path: a `reconfig` named refused at run time (a DoT cert it could not
+  read, which `named-checkconf` passes) fell back to SIGHUP, which named
+  refuses the same way, and the SIGHUP was never checked; `os.kill` failing
+  was only logged; and a named that died on its first start read back as
+  started, because a zombie still reads `named` in `/proc/<pid>/comm`. Now
+  validate runs `named-checkzone` on every zone file the render added or
+  changed (flags matching named's own `check-integrity no`, and not
+  resolving out-of-zone names over the network) and fails closed without
+  either checker; after the swap each changed zone's serial is read back
+  with `rndc zonestatus` until it matches the file; a runtime-refused
+  `reconfig`, an undeliverable SIGHUP, named exiting after SIGHUP and named
+  dying on first start all fail the reload phase, so #882 reverts and
+  alerts. Every one of those was reproduced against a real named 9.20
+  before and after the change, and SIGHUP is kept only for a control
+  channel that cannot be reached at all.
+
 - **The version-pin check now sees the Alpine-packaged daemons, and
   no longer reports a pin as behind when it is ahead (#1240).**
   BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and

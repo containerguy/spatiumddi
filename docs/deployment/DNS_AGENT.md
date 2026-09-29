@@ -430,6 +430,22 @@ running server, but the refused document has already been written to
 `kea_config_path`, and that file is what Kea reads on its next start, so a
 rejection there always rewrites the files even though the daemon is fine.
 
+**BIND's validate reads the zone files, and its reload is verified (#1224,
+#1239).** `named-checkconf` never reads zone files, so validate also runs
+`named-checkzone` on every zone file the render added or changed, with the
+same `check-integrity no` the rendered options set (`-i none`, which also
+keeps it from resolving out-of-zone MX/SRV/NS targets over the network). A
+missing checker binary fails the validate phase instead of skipping it. After
+the swap, the reload is only trusted once named confirms it: `rndc reload`
+merely *queues* a zone load and exits 0 even for a file named cannot parse,
+so the agent reads each changed zone's serial back with `rndc zonestatus`
+until it matches the file (up to 60 s), and a zone still on its old serial,
+or "not loaded", fails the reload phase. A `reconfig` named refuses at run
+time (an unreadable DoT certificate, a port in use) is a reload failure too,
+rather than a cue to SIGHUP, which named would refuse the same way; SIGHUP is
+kept only for a control channel that cannot be reached at all. A named that
+exits during its first start is reported as such instead of as started.
+
 On restart the agent checks the quarantine before re-applying `current.json`:
 a container that crash-loops must not re-break itself with the bundle that
 broke it.
@@ -688,7 +704,7 @@ Entrypoint (`entrypoint.sh`) responsibilities:
 1. Load/generate `agent-id`.
 2. Bootstrap / token refresh against control plane.
 3. Pull initial config bundle, render `named.conf`, zone files, RPZ files, TSIG keys.
-4. Validate with `named-checkconf`.
+4. Validate with `named-checkconf`, and each changed zone file with `named-checkzone`.
 5. `exec` a supervisor that runs two children: `named -g -u named` and the agent's sync loop. If either exits, kill the other and exit non-zero (let the orchestrator restart the container).
 
 The `dns-powerdns` image follows the same shape — it swaps `bind`/`named`
