@@ -286,6 +286,42 @@ def _parse_client_classes(
     return out
 
 
+def _merge_family_twins(classes: list[ImportedClientClass]) -> list[ImportedClientClass]:
+    """One class per name across the Dhcp4 and Dhcp6 blocks (#1229).
+
+    A class defined in both blocks under one name is how a dual-stack Kea
+    config spells "this class in both daemons"; the commit keys on the name,
+    so the second copy would be skipped as existing and the class would
+    silently vanish from Dhcp6. Same test and no conflicting option → one
+    ``dual`` class holding both option sets (``options_for_family`` routes
+    each). Otherwise the twin cannot be expressed as one row, and it goes to
+    manual review rather than being dropped without a word.
+    """
+    by_name: dict[str, ImportedClientClass] = {}
+    out: list[ImportedClientClass] = []
+    for cc in classes:
+        twin = by_name.get(cc.name)
+        if twin is None:
+            by_name[cc.name] = cc
+            out.append(cc)
+            continue
+        shared = set(twin.options) & set(cc.options)
+        if twin.match_expression == cc.match_expression and all(
+            twin.options[k] == cc.options[k] for k in shared
+        ):
+            twin.address_family = "dual"
+            twin.options = {**twin.options, **cc.options}
+            continue
+        cc.supported = False
+        cc.warning = (
+            f"class '{cc.name}' is defined in both Dhcp4 and Dhcp6 with a different "
+            "test or option values; SpatiumDDI holds one class per name, so the "
+            f"{cc.address_family} copy needs recreating by hand"
+        )
+        out.append(cc)
+    return out
+
+
 def _dhcp_block(obj: dict[str, Any], wrapper: str, subnet_key: str) -> dict[str, Any] | None:
     """Resolve the Dhcp4 / Dhcp6 body whether the config is wrapped
     (``{"Dhcp4": {...}}``) or bare (``{"subnet4": [...]}``)."""
@@ -348,6 +384,8 @@ def parse_kea_config(data: bytes) -> ImportPreview:
         for key, note in _UNSUPPORTED_KEYS.items():
             if key in block:
                 unsupported.append(note)
+
+    client_classes = _merge_family_twins(client_classes)
 
     if not scopes and not client_classes:
         raise KeaImportError(

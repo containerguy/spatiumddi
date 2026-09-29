@@ -262,10 +262,15 @@ the formatter handles the rest.
   each class already did: a `pkt6` / `relay6` test becomes `ipv6`, a
   `pkt4` / `relay4` test becomes `ipv4`, and any other class becomes
   `dual` if its group has a DHCPv6 scope and `ipv4` otherwise. The class
-  editor has a family picker and the class list shows the family. The
-  DHCP importer keeps the daemon block a Kea class came from. An agent
-  receiving a bundle from an older control plane renders classes as
-  before. Verified with `kea-dhcp4 -t` and `kea-dhcp6 -t` against the
+  editor has a family picker and the class list shows the family. A pool
+  cannot restrict to a class its daemon no longer defines: Kea would load
+  it and match no client. Changing a class's family is refused while such
+  a pool exists, and so is setting a pool's class to one of the wrong
+  family. The DHCP importer keeps the daemon block a Kea class came from,
+  and merges a class defined identically in both blocks into one `dual`
+  class. An agent receiving a bundle from an older control plane renders
+  classes as before. An older agent receiving a new bundle gets only the
+  options Dhcp4 can take. Verified with `kea-dhcp4 -t` and `kea-dhcp6 -t` against the
   agent's rendered config. Migration `c2f7a94e1d58` (one column with a
   default, and a backfill).
 

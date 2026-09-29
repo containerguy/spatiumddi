@@ -25,7 +25,7 @@ from app.core.security import create_access_token, hash_password
 from app.drivers.dhcp.base import ClientClassDef, ConfigBundle, PoolDef, ScopeDef, ServerOptionsDef
 from app.drivers.dhcp.kea import KeaDriver
 from app.models.auth import User
-from app.models.dhcp import DHCPClientClass, DHCPScope, DHCPServerGroup
+from app.models.dhcp import DHCPClientClass, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.config_bundle import _client_class_def
 from app.services.dhcp.option_validation import (
@@ -33,6 +33,7 @@ from app.services.dhcp.option_validation import (
     validate_class_test,
     validate_options,
 )
+from app.services.dhcp_import.kea_parser import parse_kea_config
 
 # ── The rules ────────────────────────────────────────────────────────────────
 
@@ -61,6 +62,7 @@ def test_a_test_the_familys_daemon_cannot_parse_is_refused(expression: str, fami
         ("member('KNOWN')", "dual"),
         ("substring(option[60].hex,0,4) == 'MSFT'", "dual"),
         ("mypkt4thing == 'x'", "ipv6"),  # a word, not the token
+        ("option[60].text == 'pkt4'", "ipv6"),  # a string literal, not the token
         ("", "dual"),
     ],
 )
@@ -88,6 +90,44 @@ def test_a_dual_classs_options_go_where_each_is_valid() -> None:
     v6 = {"dns-servers": ["2001:db8::53"]}
     assert options_for_family(v6, "ipv4") == {}
     assert options_for_family(v6, "ipv6") == v6
+
+
+def test_a_dual_class_keeps_legacy_and_grandfathered_options_in_dhcp4() -> None:
+    """A class stored before #583 normalised the alias, or before the write
+    check existed, rendered into Dhcp4 whole; backfilled to ``dual`` it must
+    not silently lose those options."""
+    options = {
+        "domain-name-servers": ["10.0.0.53"],
+        "dns-servers-typo": "x",
+        "dns-servers": ["2001:db8::53"],
+    }
+    assert options_for_family(options, "ipv4") == {
+        "domain-name-servers": ["10.0.0.53"],
+        "dns-servers-typo": "x",
+    }
+    assert options_for_family(options, "ipv6") == {"dns-servers": ["2001:db8::53"]}
+
+
+def test_a_kea_class_defined_in_both_blocks_imports_as_one_dual_class() -> None:
+    cfg = {
+        "Dhcp4": {
+            "subnet4": [],
+            "client-classes": [
+                {"name": "known", "test": "member('KNOWN')", "option-data": []},
+                {"name": "split", "test": "member('A')"},
+            ],
+        },
+        "Dhcp6": {
+            "subnet6": [],
+            "client-classes": [
+                {"name": "known", "test": "member('KNOWN')"},
+                {"name": "split", "test": "member('B')"},
+            ],
+        },
+    }
+    preview = parse_kea_config(json.dumps(cfg).encode())
+    by = [(c.name, c.address_family, c.supported) for c in preview.client_classes]
+    assert by == [("known", "dual", True), ("split", "ipv4", True), ("split", "ipv6", False)]
 
 
 def test_the_bundle_carries_each_familys_options() -> None:
@@ -305,3 +345,83 @@ async def test_the_backfill_keeps_what_rendered_and_fixes_what_did_not(
         "neutral_v6grp": "dual",
         "neutral_v4grp": "ipv4",
     }
+
+
+# ── Pools that restrict to a class ───────────────────────────────────────────
+
+
+async def _v6_scope(db: AsyncSession) -> tuple[DHCPServerGroup, DHCPScope]:
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db.add(space)
+    await db.flush()
+    block = IPBlock(space_id=space.id, network="2001:db8:12::/48", name="b")
+    db.add(block)
+    await db.flush()
+    subnet = Subnet(space_id=space.id, block_id=block.id, network="2001:db8:12::/64", name="s")
+    grp = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db.add_all([subnet, grp])
+    await db.flush()
+    scope = DHCPScope(subnet_id=subnet.id, group_id=grp.id, name="v6", address_family="ipv6")
+    db.add(scope)
+    await db.flush()
+    return grp, scope
+
+
+async def test_a_family_change_that_would_orphan_a_pool_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Kea accepts a pool naming a class its daemon does not define (measured),
+    so nothing would fail: the pool would just stop matching anyone."""
+    h = await _headers(db_session)
+    grp, scope = await _v6_scope(db_session)
+    cc = DHCPClientClass(group_id=grp.id, name="voip", match_expression="", address_family="dual")
+    db_session.add(cc)
+    db_session.add(
+        DHCPPool(
+            scope_id=scope.id,
+            start_ip="2001:db8:12::10",
+            end_ip="2001:db8:12::20",
+            class_restriction="voip",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.put(
+        f"/api/v1/dhcp/client-classes/{cc.id}", headers=h, json={"address_family": "ipv4"}
+    )
+    assert resp.status_code == 409, resp.text
+    assert "2001:db8:12::10-2001:db8:12::20" in resp.json()["detail"]
+
+    # Narrowing to the family the pool is in is fine.
+    resp = await client.put(
+        f"/api/v1/dhcp/client-classes/{cc.id}", headers=h, json={"address_family": "ipv6"}
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def test_a_pool_cannot_restrict_to_a_class_its_daemon_lacks(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _headers(db_session)
+    grp, scope = await _v6_scope(db_session)
+    db_session.add(
+        DHCPClientClass(group_id=grp.id, name="relay82", match_expression="", address_family="ipv4")
+    )
+    await db_session.commit()
+    body = {"start_ip": "2001:db8:12::10", "end_ip": "2001:db8:12::20"}
+
+    resp = await client.post(
+        f"/api/v1/dhcp/scopes/{scope.id}/pools",
+        headers=h,
+        json={**body, "class_restriction": "relay82"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "ipv4-only" in resp.json()["detail"]
+
+    # A name that is not an operator class (a generated or built-in one) passes.
+    resp = await client.post(
+        f"/api/v1/dhcp/scopes/{scope.id}/pools",
+        headers=h,
+        json={**body, "class_restriction": "KNOWN"},
+    )
+    assert resp.status_code == 201, resp.text

@@ -15,7 +15,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPClientClass, DHCPServerGroup
+from app.models.dhcp import DHCPClientClass, DHCPPool, DHCPScope, DHCPServerGroup
 from app.services.dhcp.option_validation import normalize_options, validate_class_test
 
 # Which Kea daemons the class renders into (#1229). ``dual`` sends each option
@@ -49,7 +49,7 @@ class ClientClassResponse(BaseModel):
     name: str
     match_expression: str
     description: str
-    address_family: str
+    address_family: ClassFamily
     options: dict[str, Any]
     created_at: datetime
     modified_at: datetime
@@ -62,6 +62,42 @@ def _check_test(expression: str, family: str) -> None:
         validate_class_test(expression, family)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def class_families(family: str) -> set[str]:
+    return {"ipv4", "ipv6"} if family == "dual" else {family}
+
+
+async def _refuse_orphaned_pools(db: DB, cc: DHCPClientClass, family: str) -> None:
+    """Refuse a family change that would leave a pool restricted to a class
+    its daemon no longer defines (#1229). Kea accepts the reference, so
+    nothing would fail: the pool would simply stop matching anyone."""
+    dropped = class_families(cc.address_family) - class_families(family)
+    if not dropped:
+        return
+    rows = (
+        await db.execute(
+            select(DHCPPool.start_ip, DHCPPool.end_ip, DHCPScope.address_family)
+            .join(DHCPScope, DHCPPool.scope_id == DHCPScope.id)
+            .where(
+                DHCPScope.group_id == cc.group_id,
+                DHCPScope.address_family.in_(dropped),
+                DHCPPool.class_restriction == cc.name,
+            )
+        )
+    ).all()
+    if rows:
+        pools = ", ".join(f"{r.start_ip}-{r.end_ip}" for r in rows[:5])
+        more = f" and {len(rows) - 5} more" if len(rows) > 5 else ""
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Client class '{cc.name}' restricts {len(rows)} pool(s) in "
+                f"{'/'.join(sorted(dropped))} scopes ({pools}{more}); after this "
+                "change their daemon would not define the class and those pools "
+                "would match no client. Clear or change the pools' class first."
+            ),
+        )
 
 
 @router.get("/server-groups/{group_id}/client-classes", response_model=list[ClientClassResponse])
@@ -119,6 +155,8 @@ async def update_class(
     changes = body.model_dump(exclude_none=True)
     family = changes.get("address_family", cc.address_family)
     family_changed = family != cc.address_family
+    if family_changed:
+        await _refuse_orphaned_pools(db, cc, family)
     if family_changed or "match_expression" in changes:
         _check_test(changes.get("match_expression", cc.match_expression), family)
     if "options" in changes or family_changed:

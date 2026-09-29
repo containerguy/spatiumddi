@@ -653,9 +653,19 @@ Named option lookups in a test (`option[host-name]`) are family-specific
 as well, but by option name, which no short list covers. For those, Kea's
 own check and the agent's revert (#882) are the backstop.
 
-A pool or subnet that names a class its daemon does not define is fine to
-Kea: the pool simply never matches. Moving a class to one family therefore
-cannot make the other daemon's config invalid.
+A pool that names a class its daemon does not define is fine to Kea, which
+is exactly the danger: the pool loads and silently matches no client. So
+the API refuses both ways of getting there. Changing a class's family is a
+`409` while a pool in the family it would leave still restricts to it, and
+the pools are named. Setting a pool's `class_restriction` to an operator
+class not rendered for the pool's family is a `422`. Names that are not
+operator classes are not checked: the generated PXE, phone and
+device-policy classes, and Kea's built-in `KNOWN`.
+
+The Kea importer keeps the daemon block each class came from. A class
+defined in both the `Dhcp4` and `Dhcp6` blocks, with the same test and no
+conflicting options, becomes one `dual` class. Otherwise the second copy
+is flagged for manual review instead of being dropped.
 
 Upgrading backfills the column (migration `c2f7a94e1d58`):
 

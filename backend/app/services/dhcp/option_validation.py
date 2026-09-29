@@ -398,8 +398,21 @@ def options_for_family(options: Mapping[str, Any], family: str) -> dict[str, Any
     as an IPv6 option and Kea rejects the whole config. Each option goes to
     the families it is valid in, and a v4-only one (``routers``) stays out of
     Dhcp6 as it always has.
+
+    Keys are checked under their canonical name, so a class stored before
+    #583 normalised ``domain-name-servers`` keeps it. And Dhcp4 still gets an
+    option neither family accepts — a grandfathered value, stored before the
+    write check existed — because before #1229 Dhcp4 received the class's
+    whole map; only an option that fits Dhcp6 and not Dhcp4 is withheld from
+    it. Dhcp6 gets strictly what it accepts, which is the #1295 fix.
     """
-    return {k: v for k, v in options.items() if _fits(str(k), v, family)}
+    other = "ipv6" if family == "ipv4" else "ipv4"
+    out: dict[str, Any] = {}
+    for k, v in options.items():
+        key = OPTION_NAME_ALIASES.get(str(k), str(k))
+        if _fits(key, v, family) or (family == "ipv4" and not _fits(key, v, other)):
+            out[k] = v
+    return out
 
 
 # Kea tokens only one daemon parses (measured with ``kea-dhcp4 -t`` /
@@ -410,6 +423,9 @@ _FAMILY_TOKENS = {
     "ipv4": re.compile(r"\b(pkt4|relay4)\b"),
     "ipv6": re.compile(r"\b(pkt6|relay6)\b"),
 }
+# A Kea string literal — ``option[60].text == 'pkt4'`` compares against the
+# text, it does not use the token, so literals are blanked before the search.
+_KEA_STRING = re.compile(r"'[^']*'")
 
 
 def validate_class_test(expression: str, address_family: str) -> None:
@@ -418,7 +434,7 @@ def validate_class_test(expression: str, address_family: str) -> None:
     for family, other in (("ipv4", "ipv6"), ("ipv6", "ipv4")):
         if address_family not in (family, "dual"):
             continue
-        hit = _FAMILY_TOKENS[other].search(expression or "")
+        hit = _FAMILY_TOKENS[other].search(_KEA_STRING.sub("''", expression or ""))
         if hit:
             label = "IPv4" if family == "ipv4" else "IPv6"
             raise ValueError(
