@@ -278,6 +278,7 @@ def _parse_client_classes(
             ImportedClientClass(
                 name=name,
                 match_expression=str(entry.get("test") or ""),
+                address_family=address_family,
                 options=_parse_option_data(entry.get("option-data"), address_family=address_family),
                 supported=True,
             )

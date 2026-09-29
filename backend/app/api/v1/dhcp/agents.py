@@ -794,7 +794,14 @@ async def agent_config_longpoll(
                             {
                                 "name": c.name,
                                 "match_expression": c.match_expression,
+                                # ``options`` stays for an agent older than
+                                # #1229, which renders it into both daemons.
+                                # A newer agent reads ``address_family`` and
+                                # the per-family maps instead.
                                 "options": c.options,
+                                "address_family": c.address_family,
+                                "options_v4": c.options_v4,
+                                "options_v6": c.options_v6,
                             }
                             for c in bundle.client_classes
                         ],

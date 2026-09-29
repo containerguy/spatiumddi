@@ -245,6 +245,30 @@ the formatter handles the rest.
     `create_dns_record` refuses it. A record in the trash does not
     count.
 
+- **A DHCPv4-only client class no longer takes down a group's DHCPv6
+  config, or the other way round (#1229, #1295).** Every client class was
+  rendered into both Kea daemons. A test using `pkt4` or `relay4`
+  (option 82 matching) makes kea-dhcp6 reject the whole config, and
+  `pkt6` / `relay6` does the same to kea-dhcp4. The agent then reverts
+  the bundle for both daemons, so one such class froze every change to
+  any group that also had a DHCPv6 scope. Separately, one options map
+  cannot serve both daemons: an IPv4 `dns-servers` on a class reached
+  Dhcp6 as option 23, which Kea rejects as malformed.
+  Client classes now have an `address_family`: `ipv4`, `ipv6` or `dual`.
+  A class is rendered only into the daemons it names. A `dual` class's
+  options each go to the daemon they are valid in. The API refuses a test
+  that uses a token the class's family cannot parse, naming the token, and
+  checks options against the family. Upgrading sets the family from what
+  each class already did: a `pkt6` / `relay6` test becomes `ipv6`, a
+  `pkt4` / `relay4` test becomes `ipv4`, and any other class becomes
+  `dual` if its group has a DHCPv6 scope and `ipv4` otherwise. The class
+  editor has a family picker and the class list shows the family. The
+  DHCP importer keeps the daemon block a Kea class came from. An agent
+  receiving a bundle from an older control plane renders classes as
+  before. Verified with `kea-dhcp4 -t` and `kea-dhcp6 -t` against the
+  agent's rendered config. Migration `c2f7a94e1d58` (one column with a
+  default, and a backfill).
+
 - **DHCP option names and values are checked when saved (#1228).**
   Scope, pool, reservation, option-template, client-class and
   device-policy options were stored as given. Only `domain-name` and
