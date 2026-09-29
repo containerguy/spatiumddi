@@ -303,14 +303,30 @@ def test_a_later_serial_passes(tmp_path: Path, monkeypatch, fast) -> None:
     """An RFC 2136 update between the reload and the check moves the serial on."""
     drv = _running(tmp_path, monkeypatch, {"a.test": 2})
     _all_tools(monkeypatch)
+    serials = iter(["serial: 1\n", "serial: 3\n"])  # before the reload, then after
     monkeypatch.setattr(
         subprocess,
         "run",
-        Script(
-            lambda cmd: (0, "serial: 3\n", "") if "zonestatus" in cmd else (0, "", "")
-        ),
+        Script(lambda cmd: (0, next(serials), "") if "zonestatus" in cmd else (0, "", "")),
     )
     drv.swap_and_reload()
+
+
+def test_a_serial_that_was_already_ahead_and_did_not_move_fails(
+    tmp_path: Path, monkeypatch, fast
+) -> None:
+    """RFC 2136 updates had taken named to 108 and the render is 105. Still
+    serving 108 afterwards is named on the OLD zone, not a later update, so
+    "at least the file's serial" alone would have passed a failed load."""
+    drv = _running(tmp_path, monkeypatch, {"a.test": 105})
+    _all_tools(monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        Script(lambda cmd: (0, "serial: 108\n", "") if "zonestatus" in cmd else (0, "", "")),
+    )
+    with pytest.raises(RuntimeError, match="serving serial 108, file has 105"):
+        drv.swap_and_reload()
 
 
 def test_verification_waits_for_a_queued_load(tmp_path: Path, monkeypatch) -> None:
@@ -340,7 +356,8 @@ def test_only_changed_zones_are_verified(tmp_path: Path, monkeypatch, fast) -> N
 
     drv.swap_and_reload()
 
-    assert [c[-1] for c in run.calls if "zonestatus" in c] == ["edited.test"]
+    # Once before the reload, once after: only the zone that changed.
+    assert [c[-1] for c in run.calls if "zonestatus" in c] == ["edited.test", "edited.test"]
 
 
 def test_a_config_named_refuses_fails_the_apply_instead_of_sighup(

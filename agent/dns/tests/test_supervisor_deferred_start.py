@@ -153,9 +153,38 @@ def test_bind9_spawn_that_dies_is_not_logged_as_started(tmp_path: Path, monkeypa
             pass
 
     monkeypatch.setattr(bind9.subprocess, "Popen", _Popen)
+    # The pid is fake: without this, a real process that happens to hold
+    # it on the test host would read as a live named.
+    monkeypatch.setattr(Bind9Driver, "daemon_running", lambda self: False)
     Bind9Driver(state_dir=tmp_path).start_daemon()
 
     assert spy.events == ["named_exited_during_startup"]
+
+
+def test_bind9_spawn_that_is_slow_to_exec_is_not_logged_as_dead(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``wait_for_daemon`` also returns False on its visibility timeout, when
+    the child is alive but still pre-``execve``; that is not an exit."""
+    conf = tmp_path / "rendered" / "named.conf"
+    conf.parent.mkdir()
+    conf.write_text("options {};\n")
+    monkeypatch.setattr(bind9, "find_running_daemon", lambda comm: None)
+    monkeypatch.setattr(bind9, "wait_for_daemon", lambda comm, pid, timeout_s=5.0: False)
+    monkeypatch.setattr(Bind9Driver, "daemon_running", lambda self: True)
+    spy = _LogSpy()
+    monkeypatch.setattr(bind9, "log", spy)
+
+    class _Popen:
+        pid = 4244
+
+        def __init__(self, cmd: list[str], *a: Any, **kw: Any) -> None:
+            pass
+
+    monkeypatch.setattr(bind9.subprocess, "Popen", _Popen)
+    Bind9Driver(state_dir=tmp_path).start_daemon()
+
+    assert spy.events == ["named_started"]
 
 
 def test_adopting_a_running_daemon_counts_as_launched(tmp_path: Path, monkeypatch) -> None:

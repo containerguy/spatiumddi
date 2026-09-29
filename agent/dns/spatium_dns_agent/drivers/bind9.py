@@ -980,6 +980,8 @@ _NAMED_START_TIMEOUT_S = 30.0
 # After SIGHUP (the no-rndc fallback) there is no channel to ask named
 # whether it took the config; this is how long it gets to fall over.
 _SIGHUP_SETTLE_S = 1.0
+# Per-call bound on the rndc queries those loops make (see ``_rndc_run``).
+_RNDC_QUERY_TIMEOUT_S = 10.0
 
 
 def _zone_views_under(root: Path) -> list[tuple[str, str | None]]:
@@ -987,8 +989,12 @@ def _zone_views_under(root: Path) -> list[tuple[str, str | None]]:
 
     The layout ``render()`` writes: ``zones/<view>/<zone>.db`` under
     split-horizon, ``zones/<zone>.db`` without views. Every primary, RPZ and
-    catalog zone file lands there; a secondary's file is written by named
-    after a transfer, never by us.
+    catalog zone file lands there. A secondary or stub zone's file lands
+    there too, but only in the LIVE tree and only once named has transferred
+    it: the render never writes one, so a staged tree holds none, while an
+    enumeration of the live tree can include them. That is harmless to the
+    callers (their serial is whatever named just wrote), but do not assume
+    every entry here is a zone we rendered.
     """
     zones = root / "zones"
     out: list[tuple[str, str | None]] = []
@@ -1073,12 +1079,48 @@ def _zonestatus_serial(out: str) -> int | None:
     return None
 
 
-def _first_line(*texts: str | None) -> str:
-    for text in texts:
-        for line in (text or "").splitlines():
-            if line.strip():
-                return line.strip()
-    return "no output"
+def _first_line(*texts: str | None, skip_warnings: bool = False) -> str:
+    """The first non-blank line across ``texts``.
+
+    ``skip_warnings`` passes over ``warning`` lines first: ``named-checkzone``
+    prints warnings (a non-terminal wildcard, say) ahead of the error that
+    actually refused the zone, and reporting the warning as the reason sends
+    the operator after the wrong record. Falls back to the first line when
+    every line is a warning.
+    """
+    lines = [
+        line.strip()
+        for text in texts
+        for line in (text or "").splitlines()
+        if line.strip()
+    ]
+    if skip_warnings:
+        for line in lines:
+            if "warning" not in line.lower():
+                return line
+    return lines[0] if lines else "no output"
+
+
+def _rndc_run(base: list[str], *args: str) -> tuple[int, str, str]:
+    """Run one ``rndc`` query with a bound on how long it may take.
+
+    rndc's own default timeout is 60 s, and the verification loops check
+    their deadlines only between calls, so an unbounded call against a
+    wedged or still-loading named could hold an apply for a minute per zone.
+    A call that times out reads as a non-answer (rc 1), which the loops
+    already treat as "not yet".
+    """
+    try:
+        res = subprocess.run(
+            [*base, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_RNDC_QUERY_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return 1, "", f"rndc {args[0]} timed out after {_RNDC_QUERY_TIMEOUT_S:g}s"
+    return res.returncode, res.stdout or "", res.stderr or ""
 
 
 class Bind9Driver(DriverBase):
@@ -1875,7 +1917,9 @@ class Bind9Driver(DriverBase):
                 timeout=300,
             )
             if res.returncode != 0:
-                detail = _first_line(res.stdout, res.stderr).replace(f"{new_dir}/", "")
+                detail = _first_line(
+                    res.stdout, res.stderr, skip_warnings=True
+                ).replace(f"{new_dir}/", "")
                 failures.append(f"{_zone_label(zname, view)}: {detail}")
         if failures:
             more = f" (and {len(failures) - 5} more)" if len(failures) > 5 else ""
@@ -1935,9 +1979,10 @@ class Bind9Driver(DriverBase):
             )
             if res.returncode == 0:
                 changed = self._changed_zones(backup)
+                before = self._serving_serials(base, changed)
                 self._reload_rendered_zones(base, changed)
                 self._sync_response_log_runtime(base)
-                self._verify_zones_loaded(base, changed)
+                self._verify_zones_loaded(base, changed, before)
                 return
             error = _first_line(res.stderr, res.stdout)
             # "rndc: 'reconfig' failed: TLS error" is named ANSWERING, and
@@ -1998,8 +2043,8 @@ class Bind9Driver(DriverBase):
                     "its log has the reason"
                 )
             if rndc:
-                res = subprocess.run([*base, "status"], capture_output=True, text=True, check=False)
-                if res.returncode == 0:
+                rc, _out, _err = _rndc_run(base, "status")
+                if rc == 0:
                     return True
             elif time.monotonic() - started >= _SIGHUP_SETTLE_S:
                 log.warning("named_start_unverified_no_rndc", pid=self.daemon_pid)
@@ -2013,10 +2058,34 @@ class Bind9Driver(DriverBase):
                 return False
             time.sleep(0.25)
 
+    def _serving_serials(
+        self, base: list[str], only: set[tuple[str, str | None]] | None
+    ) -> dict[tuple[str, str | None], int | None]:
+        """Each zone's serial as named serves it, BEFORE the reload.
+
+        What ``_verify_zones_loaded`` needs to tell "named loaded a file
+        whose serial was later still" from "named is still on the old zone,
+        which happened to be ahead". A zone named does not serve yet (a new
+        one) reads ``None``.
+        """
+        if not shutil.which("rndc"):
+            return {}
+        live = self.state_dir / self.rendered_dir_name
+        out: dict[tuple[str, str | None], int | None] = {}
+        for zname, view in _zone_views_under(live):
+            if only is not None and (zname, view) not in only:
+                continue
+            rc, stdout, _err = _rndc_run(
+                base, "zonestatus", zname, *(["in", view] if view else [])
+            )
+            out[(zname, view)] = _zonestatus_serial(stdout) if rc == 0 else None
+        return out
+
     def _verify_zones_loaded(
         self,
         base: list[str],
         only: set[tuple[str, str | None]] | None,
+        before: dict[tuple[str, str | None], int | None] | None = None,
     ) -> None:
         """Confirm named is serving what was just rendered (#1224, #1239).
 
@@ -2031,7 +2100,10 @@ class Bind9Driver(DriverBase):
         from the render: ``freeze`` writes named's in-memory zone back over a
         journal-dirty file first (see ``_reload_rendered_zones``), and that
         is the copy named loads. A serial later than the file's is accepted
-        too, since an RFC 2136 update can land in between.
+        too, since an RFC 2136 update can land in between, but only if it
+        MOVED from what named served before the reload (``before``): a zone
+        whose in-memory serial was already ahead of the file, and still
+        reads that same serial, may never have loaded the file at all.
 
         An RPZ's serial never moves (its SOA is fixed at 1), so its content
         is covered by the pre-swap ``named-checkzone`` rather than here.
@@ -2049,17 +2121,24 @@ class Bind9Driver(DriverBase):
         deadline = time.monotonic() + _ZONE_LOAD_TIMEOUT_S
         while pending:
             for (zname, view), want in list(pending.items()):
-                res = subprocess.run(
-                    [*base, "zonestatus", zname, *(["in", view] if view else [])],
-                    capture_output=True,
-                    text=True,
-                    check=False,
+                rc, out, err = _rndc_run(
+                    base, "zonestatus", zname, *(["in", view] if view else [])
                 )
-                if res.returncode != 0:
-                    why[(zname, view)] = _first_line(res.stderr, res.stdout)
+                if rc != 0:
+                    why[(zname, view)] = _first_line(err, out)
                     continue
-                got = _zonestatus_serial(res.stdout)
-                if want is None or (got is not None and _serial_at_least(got, want)):
+                got = _zonestatus_serial(out)
+                prior = (before or {}).get((zname, view))
+                loaded = (
+                    want is None
+                    or got == want
+                    or (
+                        got is not None
+                        and _serial_at_least(got, want)
+                        and (prior is None or got != prior)
+                    )
+                )
+                if loaded:
                     del pending[(zname, view)]
                 else:
                     why[(zname, view)] = f"serving serial {got}, file has {want}"
@@ -2505,7 +2584,10 @@ class Bind9Driver(DriverBase):
                 ["named", "-f", "-c", str(conf_path)]
             ).pid
             alive = wait_for_daemon("named", self.daemon_pid)
-        if not alive:
+        # ``wait_for_daemon`` also answers False on its visibility timeout (a
+        # child still pre-``execve``, i.e. alive), so a False alone is not an
+        # exit; ask whether the process is actually gone before saying so.
+        if not alive and not self.daemon_running():
             # A zombie reads back as "named" too, so this used to log
             # ``named_started`` for a daemon that had already exited (#1239).
             # Logged, not raised: at boot the supervisor's liveness poll owns

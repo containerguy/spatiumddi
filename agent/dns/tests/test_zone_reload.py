@@ -89,9 +89,9 @@ def test_swap_and_reload_reloads_each_rendered_zone_not_just_the_config(
     verbs = [c[1] for c in rndc_spy]
     assert verbs[0] == "reconfig", "config changes still need reconfig"
     # The whole point: the zone itself is reloaded, and frozen first because
-    # the loopback TSIG grant makes it dynamic. Then, since ``rndc reload``
-    # only queues the load (#1224), the zone is asked what it is serving.
-    assert verbs[1:] == ["freeze", "reload", "thaw", "zonestatus"]
+    # the loopback TSIG grant makes it dynamic. ``rndc reload`` only queues
+    # the load (#1224), so the zone is asked what it serves before and after.
+    assert verbs[1:] == ["zonestatus", "freeze", "reload", "thaw", "zonestatus"]
     for call in rndc_spy[1:]:
         assert call[2:] == ["lab.ddipg.test", "in", "meridian-internal"]
 
@@ -105,7 +105,7 @@ def test_swap_and_reload_scopes_a_flat_zone_without_a_view(
     drv.swap_and_reload()
 
     assert [c[1] for c in rndc_spy] == [
-        "reconfig", "freeze", "reload", "thaw", "zonestatus"
+        "reconfig", "zonestatus", "freeze", "reload", "thaw", "zonestatus"
     ]
     assert rndc_spy[-1][2:] == ["corp.ddipg.test"], "no `in <view>` without views"
 
