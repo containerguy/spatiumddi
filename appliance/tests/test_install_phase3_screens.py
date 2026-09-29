@@ -249,7 +249,12 @@ def test_preflight_catches_a_clock_behind_the_build_date():
 def _iso_build_date(tmp_path, stamp: str) -> str:
     release = tmp_path / "appliance-release"
     release.write_text(stamp)
-    script = extract_fn("_iso_build_date") + f"\n_iso_build_date {str(release)!r}\n"
+    script = (
+        extract_fn("_release_field")
+        + "\n"
+        + extract_fn("_iso_build_date")
+        + f"\n_iso_build_date {str(release)!r}\n"
+    )
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     return r.stdout.strip()
 
