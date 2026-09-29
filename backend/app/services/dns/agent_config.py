@@ -65,10 +65,10 @@ from app.services.dns.pool_geo import (
     view_renders_zone,
 )
 from app.services.dns.record_ops import (
-    IN_FLIGHT_ACK_TIMEOUT,
     QUEUED_OP_STATES,
-    fail_attempt,
-    rrset_key,
+    RRSET_KEY_CHUNK,
+    op_rrset_key,
+    rrset_match_where,
     supersede,
 )
 from app.services.dns.tsig import legacy_group_key, view_transfer_key
@@ -1018,9 +1018,9 @@ async def page_pending_ops(
     on every long-poll cycle until the agent's next heartbeat acks it; a
     failure ack returns it to pending with a backoff, and after
     ``MAX_OP_ATTEMPTS`` it becomes ``failed`` (#1232). One never acknowledged
-    is returned to the retry path after ``IN_FLIGHT_ACK_TIMEOUT``, and an op
-    backing off is retired (``superseded``) once a newer op for its RRset
-    ships.
+    is returned to the retry path by the heartbeat
+    (``record_ops.reset_unacknowledged_ops``), and an op backing off is
+    retired (``superseded``) once a newer op for its RRset ships.
 
     One PAGE of the queue, never the whole backlog: the agent applies a page
     and acks it on its next heartbeat; the page it was shipped is
@@ -1048,7 +1048,6 @@ async def page_pending_ops(
     if server.maintenance_mode:
         return [], 0
     now = datetime.now(UTC)
-    await _reset_unacknowledged_ops(db, server, now)
     batch = max(1, int(settings.dns_agent_ops_batch))
     conds: list[Any] = [
         DNSRecordOp.server_id == server.id,
@@ -1081,6 +1080,10 @@ async def page_pending_ops(
                 "op": op.op,
                 "record": op.record,
                 "target_serial": op.target_serial,
+                # #1232 — which dispatch this is; the agent echoes it in its
+                # ack, so a late ack for an earlier dispatch is not charged
+                # to this one.
+                "dispatch": op.attempts,
             }
         )
         op.state = "in_flight"
@@ -1091,45 +1094,6 @@ async def page_pending_ops(
     return page, remaining
 
 
-async def _reset_unacknowledged_ops(db: AsyncSession, server: DNSServer, now: datetime) -> None:
-    """Return ops shipped and never acknowledged to the retry path (#1232).
-
-    The agent keeps its acks in memory until the next heartbeat succeeds, so a
-    restart in between, or a long-poll response lost after its commit, left
-    the op ``in_flight`` forever: never re-shipped, never failed, and anything
-    waiting for ``applied`` (the ACME DNS-01 wait) timed out. Counted as a
-    failed attempt, so an op that crashes the agent cannot loop forever.
-    Runs as the agent polls, which is exactly when re-shipping can help.
-    """
-    stale = (
-        (
-            await db.execute(
-                select(DNSRecordOp).where(
-                    DNSRecordOp.server_id == server.id,
-                    DNSRecordOp.state == "in_flight",
-                    DNSRecordOp.updated_at < now - IN_FLIGHT_ACK_TIMEOUT,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    minutes = int(IN_FLIGHT_ACK_TIMEOUT.total_seconds() // 60)
-    for op in stale:
-        await fail_attempt(
-            db,
-            op,
-            f"no acknowledgement from the agent within {minutes} minutes "
-            "(it restarted, or the response was lost); retrying",
-            now=now,
-        )
-    if stale:
-        logger.warning(
-            "dns_record_ops_unacknowledged_reset", server_id=str(server.id), count=len(stale)
-        )
-        await db.flush()
-
-
 async def _supersede_backed_off_ops(
     db: AsyncSession, server: DNSServer, shipping: list[DNSRecordOp], now: datetime
 ) -> None:
@@ -1138,33 +1102,40 @@ async def _supersede_backed_off_ops(
     Every op carries the whole desired RRset (#773), so the newer op delivers
     the older one's change; left alone, the older op would retry after it and
     put the RRset back the way it was. Only ops still backing off are
-    candidates — anything older and ready ships ahead in the same page.
+    candidates — anything older and ready ships ahead in the same page — and
+    only those for an RRset in this page, matched in SQL: a bulk backlog that
+    failed can leave hundreds of thousands of ops backing off, and loading
+    them on every page is what paging exists to avoid. Strictly older only;
+    ops queued by one transaction share ``created_at``.
     """
     newest: dict[tuple[str, str, str], DNSRecordOp] = {}
     for op in shipping:
-        key = rrset_key(op)
+        key = op_rrset_key(op)
         if key is not None:
             newest[key] = op  # the page is oldest-first; the last one wins
     if not newest:
         return
-    waiting = (
-        (
-            await db.execute(
-                select(DNSRecordOp).where(
-                    DNSRecordOp.server_id == server.id,
-                    DNSRecordOp.state == "pending",
-                    DNSRecordOp.next_attempt_at > now,
+    keys = sorted(newest)
+    for i in range(0, len(keys), RRSET_KEY_CHUNK):
+        waiting = (
+            (
+                await db.execute(
+                    select(DNSRecordOp).where(
+                        DNSRecordOp.server_id == server.id,
+                        DNSRecordOp.state == "pending",
+                        DNSRecordOp.next_attempt_at > now,
+                        rrset_match_where(keys[i : i + RRSET_KEY_CHUNK]),
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    for op in waiting:
-        key = rrset_key(op)
-        successor = newest.get(key) if key is not None else None
-        if successor is not None and successor.created_at >= op.created_at:
-            supersede(op, successor, now)
+        for op in waiting:
+            key = op_rrset_key(op)
+            successor = newest.get(key) if key is not None else None
+            if successor is not None and successor.created_at > op.created_at:
+                supersede(op, successor.id, now)
 
 
 def compose_bundle(

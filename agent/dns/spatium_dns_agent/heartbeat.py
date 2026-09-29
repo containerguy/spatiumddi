@@ -19,6 +19,10 @@ from .spool import SpoolManager
 log = structlog.get_logger(__name__)
 
 
+# The control plane's ``ops_ack`` bound (``AgentHeartbeatRequest``).
+MAX_ACKS_PER_HEARTBEAT = 5000
+
+
 class HeartbeatClient:
     def __init__(
         self,
@@ -112,7 +116,11 @@ class HeartbeatClient:
         # in that window: the op stayed ``in_flight`` on the control plane
         # with no ack ever coming. The sync thread only ever appends, so the
         # first ``len(acks)`` entries are exactly the ones sent.
-        acks = list(self.pending_acks)
+        # At most MAX_ACKS_PER_HEARTBEAT: the control plane refuses a longer
+        # list (422), and with nothing ever removed the agent would wedge on
+        # it for good. Two 5000-op pages can drain between heartbeats; the
+        # rest go on the next one.
+        acks = list(self.pending_acks[:MAX_ACKS_PER_HEARTBEAT])
         body: dict[str, Any] = {
             "agent_version": __version__,
             # #638 — the DNS DAEMON's version (e.g. "5.0.5" / "9.20.26"),

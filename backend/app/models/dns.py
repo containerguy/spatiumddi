@@ -442,6 +442,10 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     """Per-record mutation queued for an agent to apply via RFC 2136."""
 
     __tablename__ = "dns_record_op"
+    # #1232 — the successor lookup (``record_ops._successors``) and the page
+    # query both read a server's ops from a point in time onward; the table
+    # is never pruned, so without this they scan every op the server ever had.
+    __table_args__ = (Index("ix_dns_record_op_server_created", "server_id", "created_at"),)
 
     server_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

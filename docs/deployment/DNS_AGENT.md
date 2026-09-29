@@ -637,22 +637,33 @@ An op moves `pending` → `in_flight` when a long-poll ships it, then
   between, or a long-poll response lost after its commit, used to leave
   the op `in_flight` for good. It was never re-shipped and never failed,
   and the ACME DNS-01 wait timed out on it. Now an op unacknowledged for
-  5 minutes returns to `pending` on the server's next poll, counted as
-  an attempt. That also recovers ops already stranded on an upgraded
-  install. Re-applying one the agent did apply is harmless: every op is
-  a whole-RRset write.
+  5 minutes returns to `pending` on the agent's next heartbeat, counted
+  as an attempt. The heartbeat applies its own acks first, so an ack
+  arriving then wins. That also recovers ops already stranded on an
+  upgraded install. Re-applying one the agent did apply is harmless:
+  every op is a whole-RRset write.
+- **A late ack is not charged twice.** Each shipped op carries a
+  `dispatch` number (its attempt count), which the agent echoes in its
+  ack. An error that answers an earlier dispatch was already counted when
+  the op was reset, so it is ignored. An agent too old to echo the stamp
+  is taken at its word. The agent also sends at most 5000 acks per
+  heartbeat, the control plane's limit, and keeps the rest for the next
+  one; a longer list used to be refused every time.
 - **A newer op for the same RRset supersedes an older one.** Every op
   carries the whole desired RRset ([#773](https://github.com/spatiumnorth/spatiumddi/issues/773)),
   so a retry of an older op after a newer one applied would put the
   RRset back the way it was. An older op that fails, or is waiting out
-  a backoff, when a newer op for its RRset exists becomes `superseded`.
+  a backoff, when a strictly newer op for its RRset exists becomes
+  `superseded`. Ops queued by one transaction share a timestamp and
+  never supersede each other.
   Its `superseded_by` points at the newer op, and the ACME wait follows
   that link. Ops that opt out of whole-RRset semantics (DNS pools, via
   `rrset_action`) are never superseded.
 - **A `failed` op is reported.** The default-on alert rule
   `dns_record_op_failed` ("DNS record change not applied") fires per
-  server for ops that failed in the last 24 h, and names the zones and
-  the last error. The server's Sync tab lists each op with its state,
+  agent-based server for ops that failed in the last 24 h, and names the
+  zones and the last error. Agentless drivers are left out: they apply
+  once, inline, and return the failure to whoever made the change. The server's Sync tab lists each op with its state,
   its attempts and when a backing-off op retries. The agent's
   heartbeat `failed_ops_count` is accepted but not stored: it counts
   failed attempts, retries included, and cannot say which op failed or

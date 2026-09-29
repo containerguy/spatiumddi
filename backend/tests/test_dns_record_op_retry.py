@@ -15,16 +15,21 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
 from app.services import acme as acme_svc
 from app.services import alerts
+from app.services.dns import agent_token as dns_tokens
 from app.services.dns.agent_config import page_pending_ops
 from app.services.dns.record_ops import (
     IN_FLIGHT_ACK_TIMEOUT,
     MAX_OP_ATTEMPTS,
     ack_op,
+    apply_acks,
+    reset_unacknowledged_ops,
     retry_delay,
 )
 
@@ -161,7 +166,7 @@ async def test_an_op_never_acknowledged_returns_to_the_retry_path(
     db_session.add_all([stale, fresh])
     await db_session.flush()
 
-    await page_pending_ops(db_session, server)
+    assert await reset_unacknowledged_ops(db_session, server.id) == 1
     assert stale.state == "pending"
     assert stale.attempts == 1
     assert "no acknowledgement" in (stale.last_error or "")
@@ -274,3 +279,118 @@ async def test_a_failed_op_raises_the_alert_for_24_hours(db_session: AsyncSessio
 
     later = now + timedelta(hours=25)
     assert await alerts._matching_dns_record_op_failed_subjects(db_session, None, later) == []  # type: ignore[arg-type]
+
+
+# ── Review follow-ups ────────────────────────────────────────────────────────
+
+
+async def test_the_heartbeat_commits_the_reset(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The reset first ran inside the long-poll, whose transaction a 304 rolls
+    back — so it never stuck, and stranded ops stayed stranded. The heartbeat
+    always commits."""
+    server, zone = await _server(db_session)
+    server.agent_fingerprint = "fp"
+    token, _exp = dns_tokens.mint_agent_token(str(server.id), str(server.agent_id), "fp")
+    server.agent_jwt_hash = dns_tokens.hash_token(token)
+    shipped = datetime.now(UTC) - IN_FLIGHT_ACK_TIMEOUT - timedelta(seconds=5)
+    stale = _op(server, zone, state="in_flight", created_at=shipped)
+    acked = _op(server, zone, name="api", state="in_flight", created_at=shipped)
+    db_session.add_all([stale, acked])
+    await db_session.commit()
+    stale_id, acked_id = stale.id, acked.id
+
+    resp = await client.post(
+        "/api/v1/dns/agents/heartbeat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"ops_ack": [{"op_id": str(acked_id), "result": "ok", "dispatch": 0}]},
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    states = dict(
+        (
+            await db_session.execute(
+                select(DNSRecordOp.id, DNSRecordOp.state).where(
+                    DNSRecordOp.id.in_([stale_id, acked_id])
+                )
+            )
+        )
+        .tuples()
+        .all()
+    )
+    # The ack in the same heartbeat wins over the reset for its own op.
+    assert states == {stale_id: "pending", acked_id: "applied"}
+
+
+async def test_the_page_stamps_each_ops_dispatch(db_session: AsyncSession) -> None:
+    server, zone = await _server(db_session)
+    op = _op(server, zone)
+    op.attempts = 2
+    db_session.add(op)
+    await db_session.flush()
+    page, _ = await page_pending_ops(db_session, server)
+    assert page[0]["dispatch"] == 2
+
+
+async def test_a_late_error_for_an_earlier_dispatch_is_not_charged_again(
+    db_session: AsyncSession,
+) -> None:
+    """Shipped (dispatch 0), reset for no ack (attempt 1), re-shipped
+    (dispatch 1): the delayed error from dispatch 0 is already counted."""
+    server, zone = await _server(db_session)
+    op = _op(server, zone, state="in_flight")
+    op.attempts = 1
+    db_session.add(op)
+    await db_session.flush()
+
+    await apply_acks(
+        db_session, server.id, [{"op_id": str(op.id), "result": "error", "dispatch": 0}]
+    )
+    assert (op.state, op.attempts) == ("in_flight", 1)
+    await apply_acks(
+        db_session, server.id, [{"op_id": str(op.id), "result": "error", "dispatch": 1}]
+    )
+    assert (op.state, op.attempts) == ("pending", 2)
+
+
+async def test_ops_queued_in_one_transaction_never_supersede_each_other(
+    db_session: AsyncSession,
+) -> None:
+    """``created_at`` is the transaction start, so two ops from one transaction
+    tie; the tie says nothing about which was stamped last."""
+    server, zone = await _server(db_session)
+    t0 = datetime.now(UTC) - timedelta(minutes=2)
+    first = _op(server, zone, values=("10.0.0.5",), state="applied", created_at=t0)
+    second = _op(server, zone, values=("10.0.0.5", "10.0.0.6"), state="in_flight", created_at=t0)
+    db_session.add_all([first, second])
+    await db_session.flush()
+    await ack_op(db_session, str(second.id), "error", "timeout", server_id=server.id)
+    assert second.state == "pending", "the op carrying 10.0.0.6 must retry"
+
+
+async def test_an_apex_op_keys_the_same_with_or_without_a_name(
+    db_session: AsyncSession,
+) -> None:
+    """The RRset stamping reads an empty name as ``@``; supersession must too."""
+    server, zone = await _server(db_session)
+    t0 = datetime.now(UTC) - timedelta(minutes=2)
+    older = _op(server, zone, name="", state="in_flight", created_at=t0)
+    newer = _op(server, zone, name="@", created_at=t0 + timedelta(seconds=30))
+    db_session.add_all([older, newer])
+    await db_session.flush()
+    await ack_op(db_session, str(older.id), "error", "x", server_id=server.id)
+    assert (older.state, older.superseded_by) == ("superseded", newer.id)
+
+
+async def test_an_agentless_failure_does_not_raise_the_retry_alert(
+    db_session: AsyncSession,
+) -> None:
+    """An agentless driver applies once, inline, and hands the failure to the
+    caller; the rule's "after every retry" would be false for it."""
+    server, zone = await _server(db_session)
+    server.driver = "route53"
+    op = _op(server, zone, state="failed")
+    db_session.add(op)
+    await db_session.flush()
+    assert await alerts._matching_dns_record_op_failed_subjects(db_session, None) == []  # type: ignore[arg-type]

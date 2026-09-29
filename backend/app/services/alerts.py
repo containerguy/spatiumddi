@@ -3528,8 +3528,15 @@ async def _matching_dns_record_op_failed_subjects(
     rule: AlertRule,  # noqa: ARG001
     now: datetime | None = None,
 ) -> list[tuple[str, str, str, str | None]]:
-    """``dns_record_op_failed`` — every DNS server with a record op that gave
-    up (``failed``) within :data:`_DNS_OP_FAILED_WINDOW` (#1232)."""
+    """``dns_record_op_failed`` — every agent-based DNS server with a record op
+    that gave up (``failed``) within :data:`_DNS_OP_FAILED_WINDOW` (#1232).
+
+    Agent-based only: an agentless driver (Windows, cloud, ``technitium_api``)
+    applies an op once, inline, and returns the failure to the caller who made
+    the change, and the retry, backoff and "until a render or agent restart"
+    this rule describes do not apply to it.
+    """
+    from app.drivers.dns import AGENTLESS_DRIVERS  # noqa: PLC0415
     from app.models.dns import DNSRecordOp, DNSServer  # noqa: PLC0415
 
     now = now or datetime.now(UTC)
@@ -3540,6 +3547,7 @@ async def _matching_dns_record_op_failed_subjects(
             .where(
                 DNSRecordOp.state == "failed",
                 DNSRecordOp.updated_at >= now - _DNS_OP_FAILED_WINDOW,
+                DNSServer.driver.not_in(sorted(AGENTLESS_DRIVERS)),
             )
             .order_by(DNSRecordOp.updated_at.desc())
         )

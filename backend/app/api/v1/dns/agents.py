@@ -74,7 +74,7 @@ from app.services.dns.agent_token import (
     verify_agent_token,
 )
 from app.services.dns.bundle_dirty import enqueue_renders
-from app.services.dns.record_ops import ack_op
+from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.feature_modules import is_module_enabled
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
@@ -818,14 +818,13 @@ async def agent_heartbeat(
     # indistinguishable from a healthy one.
     apply_reported_daemon_state(server, body.daemon, agent_kind="dns", server_id=str(server.id))
 
-    # Process op ACKs
-    for ack in body.ops_ack:
-        op_id = ack.get("op_id")
-        result = ack.get("result", "error")
-        message = ack.get("message")
-        if op_id:
-            # #1232 — scoped to this agent's own ops.
-            await ack_op(db, op_id, result, message, server_id=server.id)
+    # Process op ACKs — batched, and scoped to this agent's own ops (#1232).
+    await apply_acks(db, server.id, body.ops_ack)
+    # #1232 — then return any op this agent was sent and never acknowledged
+    # (it restarted, or the long-poll response was lost) to the retry path.
+    # After the acks, so an ack arriving now is not reset under it; here and
+    # not in the long-poll, because this transaction always commits.
+    await reset_unacknowledged_ops(db, server.id)
 
     rotated_token = None
     rotated_exp = None
@@ -852,31 +851,18 @@ async def agent_record_ops(
     db: DB,
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> dict[str, Any]:
-    """Return the queue of pending record ops targeting this server.
+    """One page of this server's queued record ops, out of band.
 
-    Agents typically pick ops up from the long-poll bundle, but this endpoint
-    lets an agent drain ops out-of-band (e.g. after a restart).
+    Agents pick ops up from the long-poll bundle; this is the same page — the
+    same backoff, the same ``in_flight`` marking and ``dispatch`` stamp
+    (#1232) — for a caller that wants the ops without the bundle. It used to
+    return every ``pending`` op unmarked, which bypassed the backoff, and an
+    error ack for an op fetched that way was not counted.
     """
     server, _ = auth
-    res = await db.execute(
-        select(DNSRecordOp)
-        .where(DNSRecordOp.server_id == server.id, DNSRecordOp.state == "pending")
-        .order_by(DNSRecordOp.created_at)
-    )
-    ops = res.scalars().all()
-    return {
-        "server_id": str(server.id),
-        "ops": [
-            {
-                "op_id": str(o.id),
-                "zone_name": o.zone_name,
-                "op": o.op,
-                "record": o.record,
-                "target_serial": o.target_serial,
-            }
-            for o in ops
-        ],
-    }
+    ops, remaining = await page_pending_ops(db, server)
+    await db.commit()
+    return {"server_id": str(server.id), "ops": ops, "remaining": remaining}
 
 
 @router.post("/ops/{op_id}/ack")

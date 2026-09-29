@@ -260,10 +260,13 @@ the formatter handles the rest.
   - A failed op waits 30 s, 1 m, 2 m, 4 m, 8 m, 15 m and 15 m between
     attempts, and fails after 8, about 45 minutes.
   - An op unacknowledged for 5 minutes returns to the retry path on the
-    server's next poll. That also recovers ops already stranded.
-  - The agent removes only the acks it actually sent.
-  - A failed op raises the new default-on alert rule
-    `dns_record_op_failed`. The server's Sync tab shows when a
+    agent's next heartbeat. That also recovers ops already stranded.
+  - The agent removes only the acks it actually sent, and sends at most
+    the 5000 per heartbeat the control plane accepts. Each op carries a
+    dispatch number the agent echoes, so a late error for an earlier
+    dispatch is not charged twice.
+  - A failed op on an agent-based server raises the new default-on
+    alert rule `dns_record_op_failed`. The server's Sync tab shows when a
     backing-off op retries.
 
   Retrying an older op after a newer one for the same RRset applied
@@ -272,7 +275,8 @@ the formatter handles the rest.
   likelier. Such an older op now becomes `superseded` instead, and the
   ACME wait follows it to the op that delivered its change. Also, an
   ack from one agent can no longer change another server's op.
-  Migration `d8e1b5a26c47` (two nullable columns).
+  Migration `d8e1b5a26c47` (two nullable columns and an index on
+  `(server_id, created_at)`).
 
 - **DHCP option names and values are checked when saved (#1228).**
   Scope, pool, reservation, option-template, client-class and
