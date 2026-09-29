@@ -146,6 +146,10 @@ class AgentHeartbeatRequest(BaseModel):
     spool: dict[str, Any] | None = None
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
+    # Cumulative failed APPLY ATTEMPTS since the agent started, retries
+    # included. Accepted and deliberately not stored (#1232): it cannot say
+    # which op failed or whether a retry then succeeded. The op rows are the
+    # record — ``failed`` ops raise ``dns_record_op_failed``.
     failed_ops_count: int = 0
     disk_free_bytes: int | None = None
     # #430 (D6) — deprecated: serial convergence is reported via the
@@ -820,7 +824,8 @@ async def agent_heartbeat(
         result = ack.get("result", "error")
         message = ack.get("message")
         if op_id:
-            await ack_op(db, op_id, result, message)
+            # #1232 — scoped to this agent's own ops.
+            await ack_op(db, op_id, result, message, server_id=server.id)
 
     rotated_token = None
     rotated_exp = None
@@ -886,7 +891,9 @@ async def agent_ops_ack(
     op = await db.get(DNSRecordOp, op_id)
     if op is None or op.server_id != server.id:
         raise HTTPException(status_code=404, detail="Op not found")
-    await ack_op(db, str(op_id), body.get("result", "error"), body.get("message"))
+    await ack_op(
+        db, str(op_id), body.get("result", "error"), body.get("message"), server_id=server.id
+    )
     await db.commit()
     return {"status": "ok"}
 

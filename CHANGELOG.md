@@ -245,6 +245,35 @@ the formatter handles the rest.
     `create_dns_record` refuses it. A record in the trash does not
     count.
 
+- **DNS record changes an agent could not apply are retried with
+  backoff, recovered when never acknowledged, and reported when they
+  give up (#1232).** Three faults, all silent. A failed apply was
+  retried on every heartbeat, so a DNS daemon restart of about
+  2.5 minutes spent all five attempts and the change was dropped for
+  good. An op shipped to an agent that restarted before its next
+  heartbeat, or whose long-poll response was lost, stayed `in_flight`
+  forever: never re-shipped, never failed, and the ACME DNS-01 wait
+  timed out on it. The agent could also drop an ack appended while a
+  heartbeat was in flight, with the same result. And nothing reported a
+  failed op: the record was in SpatiumDDI and the UI but not on the
+  server, until the next full render. Now:
+  - A failed op waits 30 s, 1 m, 2 m, 4 m, 8 m, 15 m and 15 m between
+    attempts, and fails after 8, about 45 minutes.
+  - An op unacknowledged for 5 minutes returns to the retry path on the
+    server's next poll. That also recovers ops already stranded.
+  - The agent removes only the acks it actually sent.
+  - A failed op raises the new default-on alert rule
+    `dns_record_op_failed`. The server's Sync tab shows when a
+    backing-off op retries.
+
+  Retrying an older op after a newer one for the same RRset applied
+  would have reverted the newer change, because every op carries the
+  whole RRset (#773). This was possible before, and backoff makes it
+  likelier. Such an older op now becomes `superseded` instead, and the
+  ACME wait follows it to the op that delivered its change. Also, an
+  ack from one agent can no longer change another server's op.
+  Migration `d8e1b5a26c47` (two nullable columns).
+
 - **DHCP option names and values are checked when saved (#1228).**
   Scope, pool, reservation, option-template, client-class and
   device-policy options were stored as given. Only `domain-name` and

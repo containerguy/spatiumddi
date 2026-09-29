@@ -621,6 +621,45 @@ data out to every server directly.
   immediately. The op state is per-server, so partial convergence is
   visible per `server_id`.
 
+#### Retries, unacknowledged ops and supersession ([#1232](https://github.com/spatiumnorth/spatiumddi/issues/1232))
+
+An op moves `pending` → `in_flight` when a long-poll ships it, then
+`applied` when the agent's next heartbeat acknowledges it.
+
+- **A failed apply backs off.** The op returns to `pending` with
+  `next_attempt_at` set, and it is not shipped again until then. The
+  delays are 30 s, 1 m, 2 m, 4 m, 8 m, 15 m and 15 m. After 8 attempts,
+  about 45 minutes, the op becomes `failed`. Retries used to go out on
+  every heartbeat, so a daemon restart of about 2.5 minutes spent all
+  five of them.
+- **An op that is never acknowledged is retried.** The agent keeps its
+  acks in memory until a heartbeat succeeds. So an agent restart in
+  between, or a long-poll response lost after its commit, used to leave
+  the op `in_flight` for good. It was never re-shipped and never failed,
+  and the ACME DNS-01 wait timed out on it. Now an op unacknowledged for
+  5 minutes returns to `pending` on the server's next poll, counted as
+  an attempt. That also recovers ops already stranded on an upgraded
+  install. Re-applying one the agent did apply is harmless: every op is
+  a whole-RRset write.
+- **A newer op for the same RRset supersedes an older one.** Every op
+  carries the whole desired RRset ([#773](https://github.com/spatiumnorth/spatiumddi/issues/773)),
+  so a retry of an older op after a newer one applied would put the
+  RRset back the way it was. An older op that fails, or is waiting out
+  a backoff, when a newer op for its RRset exists becomes `superseded`.
+  Its `superseded_by` points at the newer op, and the ACME wait follows
+  that link. Ops that opt out of whole-RRset semantics (DNS pools, via
+  `rrset_action`) are never superseded.
+- **A `failed` op is reported.** The default-on alert rule
+  `dns_record_op_failed` ("DNS record change not applied") fires per
+  server for ops that failed in the last 24 h, and names the zones and
+  the last error. The server's Sync tab lists each op with its state,
+  its attempts and when a backing-off op retries. The agent's
+  heartbeat `failed_ops_count` is accepted but not stored: it counts
+  failed attempts, retries included, and cannot say which op failed or
+  whether a retry then worked.
+- **An ack only applies to the acking agent's own server.** An ack for
+  another server's op is ignored.
+
 > **Optional native secondary path.** A zone may instead be declared a
 > `secondary` / `slave` / `stub` zone (issue #336) with an explicit
 > `masters` list, in which case the daemon AXFRs the zone from those

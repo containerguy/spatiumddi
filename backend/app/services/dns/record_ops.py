@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Collection
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -35,8 +35,112 @@ logger = structlog.get_logger(__name__)
 
 # Queued-op states. ``in_flight`` is queued work too: an op already shipped is
 # not finished with — ``ack_op`` returns a NACKed one to ``pending`` — so any
-# sweep of a zone's queue must cover both (the #934 review finding).
+# sweep of a zone's queue must cover both (the #934 review finding). The
+# terminal states are ``applied``, ``failed`` and ``superseded`` (#1232).
 QUEUED_OP_STATES: tuple[str, ...] = ("pending", "in_flight")
+
+
+# #1232 — retry policy for an op the agent failed to apply. Exponential,
+# 30 s doubling to a 15 min cap: 30 s, 1 m, 2 m, 4 m, 8 m, 15 m, 15 m, i.e.
+# about 45 minutes before the op is given up on. Retries used to go out on
+# every heartbeat, so five attempts were spent inside a ~2.5 minute daemon
+# restart or upgrade — exactly the outage a retry exists to ride out.
+MAX_OP_ATTEMPTS = 8
+OP_RETRY_BASE_SECONDS = 30
+OP_RETRY_MAX_SECONDS = 15 * 60
+# An op shipped and never acknowledged — the agent restarted before its next
+# heartbeat (it keeps its acks in memory), or the long-poll response was lost
+# after its commit — used to stay ``in_flight`` forever. The agent acks on its
+# next heartbeat (~30 s) and keeps an unsent ack across failed heartbeats, so
+# five minutes is several missed heartbeats, not a slow one.
+IN_FLIGHT_ACK_TIMEOUT = timedelta(minutes=5)
+
+
+def retry_delay(attempts: int) -> timedelta:
+    """Backoff after the ``attempts``-th failed attempt (1-based)."""
+    exp = max(0, attempts - 1)
+    return timedelta(seconds=min(OP_RETRY_BASE_SECONDS * (2 ** min(exp, 16)), OP_RETRY_MAX_SECONDS))
+
+
+def rrset_key(op: DNSRecordOp) -> tuple[str, str, str] | None:
+    """The RRset an op rewrites, or None when it carries no whole-RRset state.
+
+    Only an op with an ``rrset`` (#773) is a complete statement of what the
+    RRset should be; one that opted out via ``rrset_action`` (DNS pools) or
+    carries none (the DNSSEC signal op) says nothing about a sibling op, so
+    it neither supersedes nor is superseded.
+    """
+    record = op.record or {}
+    if "rrset" not in record or not record.get("name") or not record.get("type"):
+        return None
+    return (op.zone_name.lower(), str(record["name"]).lower(), str(record["type"]).upper())
+
+
+async def newer_op_for_rrset(db: AsyncSession, op: DNSRecordOp) -> DNSRecordOp | None:
+    """The newest op for the same server and RRset queued after ``op``, if any.
+
+    It carries the whole desired RRset as of a later moment, so it already
+    delivers ``op``'s change; retrying ``op`` after it would put the older
+    state back. A ``failed`` or ``superseded`` successor does not count.
+    """
+    key = rrset_key(op)
+    if key is None:
+        return None
+    zone, name, rtype = key
+    return (
+        await db.execute(
+            select(DNSRecordOp)
+            .where(
+                DNSRecordOp.server_id == op.server_id,
+                DNSRecordOp.zone_name == op.zone_name,
+                DNSRecordOp.id != op.id,
+                DNSRecordOp.created_at >= op.created_at,
+                DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
+                DNSRecordOp.record.has_key("rrset"),
+                func.lower(DNSRecordOp.record["name"].astext) == name,
+                func.upper(DNSRecordOp.record["type"].astext) == rtype,
+            )
+            .order_by(DNSRecordOp.created_at.desc(), DNSRecordOp.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+def supersede(op: DNSRecordOp, successor: DNSRecordOp, now: datetime) -> None:
+    op.state = "superseded"
+    op.superseded_by = successor.id
+    op.next_attempt_at = None
+    op.updated_at = now
+
+
+async def fail_attempt(db: AsyncSession, op: DNSRecordOp, message: str, *, now: datetime) -> None:
+    """Account for one failed or unacknowledged attempt at ``op`` (#1232).
+
+    Superseded when a newer op for the RRset exists; otherwise back to
+    ``pending`` with a backoff, or ``failed`` once the budget is spent.
+    """
+    op.attempts += 1
+    op.last_error = message
+    op.updated_at = now
+    successor = await newer_op_for_rrset(db, op)
+    if successor is not None:
+        supersede(op, successor, now)
+    elif op.attempts >= MAX_OP_ATTEMPTS:
+        op.state = "failed"
+        op.next_attempt_at = None
+        logger.warning(
+            "dns_record_op_failed",
+            op_id=str(op.id),
+            server_id=str(op.server_id),
+            zone=op.zone_name,
+            name=(op.record or {}).get("name"),
+            type=(op.record or {}).get("type"),
+            attempts=op.attempts,
+            error=message,
+        )
+    else:
+        op.state = "pending"
+        op.next_attempt_at = now + retry_delay(op.attempts)
 
 
 def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
@@ -843,23 +947,42 @@ async def _apply_agentless_batch(
     return list(op_rows)
 
 
-async def ack_op(db: AsyncSession, op_id: str, result: str, message: str | None = None) -> None:
-    """Mark an op applied (ok) or failed."""
-    from datetime import UTC, datetime
+async def ack_op(
+    db: AsyncSession,
+    op_id: str,
+    result: str,
+    message: str | None = None,
+    *,
+    server_id: uuid.UUID | None = None,
+) -> None:
+    """Record an agent's verdict on one op (#1232).
 
-    op = await db.get(DNSRecordOp, op_id)
-    if op is None:
+    ``server_id`` is the acking agent's server: an ack for another server's op
+    is ignored, where it used to be applied to whatever op the id named.
+
+    An ``ok`` marks the op applied from any state — a late ack for an op the
+    stale-``in_flight`` reset already returned to ``pending`` is still true.
+    An error counts as a failed attempt only while the op is ``in_flight``: in
+    any other state the attempt has already been accounted for (by the reset,
+    or by an earlier duplicate ack), and counting it again would spend the
+    retry budget twice.
+    """
+    try:
+        op = await db.get(DNSRecordOp, uuid.UUID(str(op_id)))
+    except ValueError:
         return
-    op.attempts += 1
+    if op is None or (server_id is not None and op.server_id != server_id):
+        return
+    now = datetime.now(UTC)
     if result == "ok":
-        op.state = "applied"
-        op.applied_at = datetime.now(UTC)
-        op.last_error = None
-    else:
-        op.last_error = message
-        if op.attempts >= 5:
-            op.state = "failed"
-        else:
-            # Reset to pending so it gets re-shipped in the next bundle.
-            op.state = "pending"
+        if op.state != "applied":
+            if op.state == "in_flight":
+                op.attempts += 1
+            op.state = "applied"
+            op.applied_at = now
+            op.last_error = None
+            op.next_attempt_at = None
+            op.updated_at = now
+    elif op.state == "in_flight":
+        await fail_attempt(db, op, message or "the agent reported an error", now=now)
     await db.flush()
