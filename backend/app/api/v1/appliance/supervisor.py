@@ -1309,11 +1309,19 @@ class SupervisorHeartbeatRequest(BaseModel):
     firewall_applied_status: str | None = None
     firewall_base_marker: str | None = None
     # #272 Phase 9 — dead-node replacement. The SEED supervisor reports
-    # the hostnames of k8s Nodes it successfully evicted (deleting the
-    # Node makes k3s drop the etcd member). The handler clears
-    # ``evict_requested`` + settles those rows to ``left``. Empty on
-    # every non-seed heartbeat + when there's nothing to evict.
+    # the hostnames it evicted. The handler clears ``evict_requested`` +
+    # settles those rows to ``left``. Empty on every non-seed heartbeat +
+    # when there's nothing to evict.
+    #
+    # #1284 — "evicted" means the node's etcd member is gone, not only its
+    # k8s Node: a node that became an etcd voter before its Node registered
+    # has no Node to delete, and k3s removes a server's member only through
+    # its Node. The seed reports a name here once etcd no longer lists it.
     evicted_node_names: list[str] = Field(default_factory=list)
+    # #1284 — hostnames the seed was asked to evict but has not confirmed,
+    # each with why (its etcd member is still listed, or the removal
+    # failed). The row stays ``evicting`` and shows the reason.
+    evict_pending: dict[str, str] = Field(default_factory=dict)
     # #272 Phase 9b — etcd snapshot inventory + restore progress. The
     # SEED reports its local ``k3s etcd-snapshot list`` so the Fleet tab
     # can show recoverable snapshots; ``restore_state`` /
@@ -1532,6 +1540,16 @@ class SupervisorHeartbeatResponse(BaseModel):
     # ones it deleted back via ``evicted_node_names`` so the backend
     # clears the flag. Empty in the steady state.
     evict_node_names: list[str] = Field(default_factory=list)
+    # #1284 — the node IPs of each name above. k3s names an etcd member
+    # ``<node name>-<8 hex>`` only once it has started; a learner that never
+    # did is matched by its peer URL's host.
+    evict_node_addresses: dict[str, list[str]] = Field(default_factory=dict)
+    # #1284 — hostnames the control plane has asked to join (a promote in
+    # flight), sent to the seed. For a few minutes after an eviction the seed
+    # removes an etcd member that appears under the evicted name: a re-join
+    # that was already in flight when Replace landed. A node promoted again
+    # is wanted, so the seed ends that watch for a name listed here.
+    join_node_names: list[str] = Field(default_factory=list)
     # Issue #165 — operator-set IANA timezone from
     # ``platform_settings.timezone``. Empty string = follow the
     # install-time default (no override). The supervisor compares
@@ -2040,9 +2058,11 @@ async def supervisor_heartbeat(
             .on_conflict_do_update(index_elements=["appliance_id"], set_=fw_sets)
         )
 
-    # #272 Phase 9 — the seed reports k8s Nodes it evicted (dead-node
+    # #272 Phase 9 — the seed reports the nodes it evicted (dead-node
     # replacement). Clear the flag + settle those rows to ``left`` so
     # they stop appearing in the seed's evict list on the next tick.
+    # #1284 — the seed reports a name only once the node's etcd member is
+    # gone, so ``left`` means etcd agrees.
     if body.evicted_node_names:
         evicted = (
             (
@@ -2059,7 +2079,33 @@ async def supervisor_heartbeat(
         for ev in evicted:
             ev.evict_requested = False
             ev.cluster_join_state = CLUSTER_JOIN_STATE_LEFT
+            ev.cluster_join_reason = None
             logger.info("control_plane_node_evicted", hostname=ev.hostname, by=str(row.id))
+    # #1284 — an eviction the seed has not confirmed yet stays ``evicting``,
+    # with the seed's reason on the row so the Fleet UI says what it waits on.
+    if body.evict_pending:
+        waiting = (
+            (
+                await db.execute(
+                    select(Appliance).where(
+                        Appliance.hostname.in_(list(body.evict_pending)),
+                        Appliance.evict_requested.is_(True),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for ev in waiting:
+            reason = str(body.evict_pending.get(ev.hostname or "") or "")[:500]
+            if reason and ev.cluster_join_reason != reason:
+                ev.cluster_join_reason = reason
+                logger.info(
+                    "control_plane_eviction_pending",
+                    hostname=ev.hostname,
+                    reason=reason,
+                    by=str(row.id),
+                )
 
     # Auto-clear the promote desired-state once the join landed: the
     # supervisor reports ``ready`` → the node IS a member now, so settle
@@ -2527,19 +2573,37 @@ async def supervisor_heartbeat(
         )
         await db.commit()
 
-    # #272 Phase 9 — dead k8s Nodes the seed should evict. Returned to
-    # every CP supervisor but only the control-plane-variant seed acts.
-    evict_names = [
-        h
-        for (h,) in (
-            await db.execute(
-                select(Appliance.hostname).where(
-                    Appliance.evict_requested.is_(True),
-                    Appliance.hostname.isnot(None),
+    # #272 Phase 9 — dead nodes the seed should evict. Returned to every CP
+    # supervisor but only the control-plane-variant seed acts. #1284 — with
+    # each node's IPs, so the seed can match an etcd member that has no name.
+    evict_rows = (
+        await db.execute(
+            select(Appliance.hostname, Appliance.node_ips, Appliance.node_ip).where(
+                Appliance.evict_requested.is_(True),
+                Appliance.hostname.isnot(None),
+            )
+        )
+    ).all()
+    evict_names = [h for (h, _ips, _ip) in evict_rows]
+    evict_addresses = {
+        h: [str(a) for a in (ips or ([ip] if ip else []))] for (h, ips, ip) in evict_rows
+    }
+    # #1284 — and the nodes asked to join, so the seed never takes a node
+    # promoted again after its eviction for a late arrival of the evicted one.
+    join_names: list[str] = []
+    if row.cluster_role == CLUSTER_ROLE_PRIMARY:
+        join_names = sorted(
+            (
+                await db.execute(
+                    select(Appliance.hostname).where(
+                        Appliance.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER,
+                        Appliance.hostname.isnot(None),
+                    )
                 )
             )
-        ).all()
-    ]
+            .scalars()
+            .all()
+        )
 
     return SupervisorHeartbeatResponse(
         appliance_id=row.id,
@@ -2579,6 +2643,8 @@ async def supervisor_heartbeat(
         desired_metallb_bgp_peers=metallb_bgp_peers,
         desired_metallb_bgp_advertisements=metallb_bgp_advertisements,
         evict_node_names=evict_names,
+        evict_node_addresses=evict_addresses,
+        join_node_names=join_names,
         desired_timezone=desired_timezone,
         desired_console_mode=desired_console_mode,
         snmp_settings=snmp_block,
@@ -4413,6 +4479,13 @@ async def replace_control_plane_member(
     pairing code is minted for the replacement box. Refuses the etcd
     seed (migrating the seed is a separate flow) and any row that isn't
     a settled control-plane member.
+
+    #1284 — the row settles ``left`` only once the seed's etcd no longer
+    lists the node. A node can be an etcd member with no k8s Node (a
+    failed joiner whose own retry made it a voter before its Node
+    registered), and k3s removes a server's member only through its Node,
+    so the seed removes such a member itself. Until etcd agrees the row
+    stays ``evicting``, with the seed's reason.
     """
     _require_superadmin(current_user)
 

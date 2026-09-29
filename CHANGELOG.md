@@ -336,6 +336,31 @@ the formatter handles the rest.
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
 
+- **Fleet → Replace removes the node's etcd member, not only its
+  k8s Node, and the row settles `left` only once etcd agrees
+  (#1284).** The seed evicted a replaced node by deleting its k8s
+  Node, which makes k3s drop a server's etcd member, and settled the
+  row `left` on that alone. A 404 counted as success. A node can be
+  an etcd member with no Node at all: a failed joiner whose own
+  automatic re-join made it a voter, then died before its Node
+  registered. Replace accepts exactly that row, and the dead voter
+  then kept its seat for good. The cluster ran on two live voters of
+  three with no fault tolerance, and etcd refused every later member
+  add ("etcdserver: unhealthy cluster"), so the replacement Replace
+  was for could never join. The seed now also removes the node's
+  etcd member itself, through a new host runner
+  (`spatium-etcd-evict`, behind `spatiumddi-etcd-evict.path`). The
+  member is matched by the name k3s gives it
+  (`<hostname>-<8 hex>`), or, before it has a name, by a peer URL on
+  the node's addresses; the seed's own member is never touched. It
+  reports the node evicted only once etcd no longer lists it. Until
+  then the row stays `evicting`, with the reason in the Fleet UI. A
+  member that appears for the name within five minutes of the
+  eviction is removed too: a re-join that was already in flight when
+  Replace landed. A node that is promoted again in that time is
+  exempt, since its new member is wanted. A seed whose OS slot
+  predates the runner keeps the old behaviour.
+
 - **A join the seed's etcd refuses is rolled back with its reason,
   instead of sitting `joining` for good (#1285).** The join runner's
   #1052 guard, which stops a node that already joined the seed's etcd
