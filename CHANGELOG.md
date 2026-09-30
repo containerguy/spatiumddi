@@ -336,6 +336,21 @@ the formatter handles the rest.
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
 
+- **After a DHCP agent restart, an address that has changed hands no
+  longer drops out of IPAM while its new client holds it (#1318).**
+  The agent re-reads its whole lease file on every start, so an old
+  client's grant and release of an address are delivered again after
+  the address has gone to a new client. The lease-events endpoint
+  handled that release by deleting the address's IPAM row: it spared
+  the row only while another server of the group held the lease
+  (#1110), not while another client on the same server did. The
+  address was then missing from IPAM, with its lease listed as active,
+  until the replay reached the new client's own grant, and its row came
+  back as a new row without its MAC history. With New-device watch on,
+  #1172 hid this by losing the replayed batch whole. A release now
+  leaves the row in place while another lease on the address is active
+  and unexpired.
+
 - **With New-device watch on, a DHCP lease batch that grants and releases
   the same address is no longer lost (#1172).** With the watch on, the
   lease-events endpoint records a MAC sighting for each active lease after

@@ -147,6 +147,42 @@ async def peer_holds_active_lease(db: AsyncSession, lease: DHCPLease, *, now: da
     return res.first() is not None
 
 
+async def another_client_holds_address(
+    db: AsyncSession, lease: DHCPLease, *, now: datetime
+) -> bool:
+    """Does another lease ON THE SAME SERVER still hold ``lease``'s address? (#1318)
+
+    A server reports one lease row per address and client, so once an
+    address has moved from one client to the next the server has two rows
+    for it: the old client's, ended, and the new client's, active. The IPAM
+    mirror and the DDNS records belong to the address, so an event that ends
+    the OLD client's lease must not take them from the new one.
+
+    That event arrives late every time the agent replays its lease file. It
+    re-reads the whole file on every start, so the old client's grant and
+    release of the address are delivered again after the address has changed
+    hands. The release used to delete the new client's mirror, and the
+    address was missing from IPAM until the replay reached the new client's
+    own grant.
+
+    A row counts only while it is ``active`` and not past its expiry, the
+    rule :func:`peer_holds_active_lease` applies to the other servers of the
+    group.
+    """
+    res = await db.execute(
+        select(DHCPLease.id)
+        .where(
+            DHCPLease.server_id == lease.server_id,
+            DHCPLease.ip_address == lease.ip_address,
+            DHCPLease.id != lease.id,
+            DHCPLease.state == "active",
+            or_(DHCPLease.expires_at.is_(None), DHCPLease.expires_at > now),
+        )
+        .limit(1)
+    )
+    return res.first() is not None
+
+
 async def purge_lease(
     db: AsyncSession,
     lease: DHCPLease,
