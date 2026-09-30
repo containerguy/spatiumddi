@@ -455,6 +455,42 @@ the formatter handles the rest.
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
 
+- **After a DHCP agent restart, an address that has changed hands no
+  longer drops out of IPAM while its new client holds it (#1318).**
+  The agent re-reads its whole lease file on every start, so an old
+  client's grant and release of an address are delivered again after
+  the address has gone to a new client. The lease-events endpoint
+  handled that release by deleting the address's IPAM row: it spared
+  the row only while another server of the group held the lease
+  (#1110), not while another client on the same server did. The
+  address was then missing from IPAM, with its lease listed as active,
+  until the replay reached the new client's own grant, and its row came
+  back as a new row without its MAC history. With New-device watch on,
+  #1172 hid this by losing the replayed batch whole. A release now
+  leaves the row in place while another lease on the address is active
+  and unexpired. The expiry sweep and the lease purge (the Windows
+  poll's absence-delete and the delete-lease endpoint) ask the same
+  question, so an old client's lease left `active` past its expiry no
+  longer takes the new client's IPAM row and DNS records with it either.
+
+- **With New-device watch on, a DHCP lease batch that grants and releases
+  the same address is no longer lost (#1172).** With the watch on, the
+  lease-events endpoint records a MAC sighting for each active lease after
+  the IPAM mirror pass. When the same batch also released, expired or
+  declined that address, the pass had already deleted its IPAM row, so the
+  sighting's insert failed its foreign key. The loop caught the error
+  without a savepoint, the transaction stayed aborted, and the whole batch
+  was lost: its leases, IPAM mirror changes, DDNS changes and dedupe
+  receipt. The agent was answered 200 and did not resend, or 500 when the
+  batch had changed DNS records, which it resent unchanged until its spool
+  quarantined the batch while newer lease events waited behind it. The
+  agent batches every 5 seconds and re-reads its whole lease file on every
+  start, so ordinary churn and any agent restart could trigger it. A
+  sighting is now skipped when the same batch deleted its row, each
+  sighting runs in its own savepoint so one that fails rolls back only
+  itself, and the `device.first_seen` audit rows are written after the
+  last sighting, so none is published before the batch commits.
+
 - **Deleting a DHCP reservation whose client still holds its lease
   no longer shows the address as free (#1274).** The reserved client's
   grant arrives while the address is a reservation, which the lease
