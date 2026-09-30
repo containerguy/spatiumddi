@@ -2398,6 +2398,10 @@ export interface MfaStatusResponse {
   enabled: boolean;
   enrolment_pending: boolean;
   recovery_codes_remaining: number;
+  /** What starting an enrolment asks for (#1241). */
+  enrol_requires: "password" | "recent_sign_in";
+  /** For `recent_sign_in`: false means sign out and back in first. */
+  enrol_sign_in_recent: boolean;
 }
 
 export interface MfaEnrolBeginResponse {
@@ -9634,9 +9638,9 @@ export const authApi = {
   // ── MFA (issue #69) ─────────────────────────────────────────────────
   mfaStatus: () =>
     api.get<MfaStatusResponse>("/auth/mfa/status").then((r) => r.data),
-  mfaEnrollBegin: () =>
+  mfaEnrollBegin: (password?: string) =>
     api
-      .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin")
+      .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin", { password })
       .then((r) => r.data),
   mfaEnrollVerify: (code: string) =>
     api.post("/auth/mfa/enroll/verify", { code }),
