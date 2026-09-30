@@ -868,6 +868,7 @@ appliance-stamp-dev:
 	  echo "# CI release builds overwrite this with the real CalVer tag."; \
 	  echo "APPLIANCE_VERSION=\"$(SPATIUMDDI_VERSION)\""; \
 	  echo "APPLIANCE_ARCH=\"$(notdir $(APPLIANCE_ARCH))\""; \
+	  echo "APPLIANCE_PROFILE=\"$(APPLIANCE_PROFILE)\""; \
 	} > $$f; \
 	echo "→ Stamped appliance-release: $$(cat $$f | grep APPLIANCE_VERSION)"
 
