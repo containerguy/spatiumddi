@@ -207,6 +207,45 @@ def _join_retry_window_elapsed(state_at: datetime | None, now: datetime | None =
     return now - state_at > _JOIN_AUTO_RETRY_WINDOW
 
 
+def _evicted_row_ignores_report(
+    row_state: str | None,
+    desired_role: str | None,
+    evict_requested: bool,
+    reported: str,
+) -> bool:
+    """PURE: whether a node's reported join state must NOT move its row (#1317).
+
+    An evicted row is the control plane's verdict, reached on the SEED's word:
+    Replace flags it, the seed removes the node's k8s Node and etcd member,
+    the row settles ``left``. The node it belonged to can still be alive — a
+    failed joiner back on its standalone control plane, a member the network
+    cut off that later returns — and it goes on reporting what its host
+    runner last wrote: ``failed`` (its supervisor re-fires a failed join on
+    its own, so a retry can still be running when Replace is accepted, and
+    its verdict arrives when it ends), ``ready`` for ever. Applied, either
+    one undoes the eviction on the row alone: a late ``failed`` turned a
+    settled ``left`` back into a failed joiner (seen live, seconds after the
+    settle), and a ``ready`` re-settles the row as a member etcd no longer
+    has.
+
+    So while a row is being evicted (``evicting`` / ``evict_requested``)
+    nothing the node reports moves it, and once it is ``left`` with nothing
+    asked of the node only a matching ``left`` is applied. A desired role — a
+    new promote, a demote in flight — makes the node's reports count again,
+    and a row whose bookkeeping was cleared (state ``None``) keeps #590's
+    reported-``ready`` self-heal."""
+    if desired_role is not None:
+        return False
+    if evict_requested or row_state == CLUSTER_JOIN_STATE_EVICTING:
+        return True
+    return row_state == CLUSTER_JOIN_STATE_LEFT and reported != CLUSTER_JOIN_STATE_LEFT
+
+
+# The last ignored report logged per row (this process), so a node that keeps
+# reporting the same state costs one log line, not one per heartbeat.
+_ignored_join_reports_logged: dict[uuid.UUID, str] = {}
+
+
 router = APIRouter()
 
 
@@ -1997,7 +2036,28 @@ async def supervisor_heartbeat(
         # Only the primary reports a token; store it Fernet-encrypted so
         # the promote endpoint can hand it to joiners.
         row.k3s_join_token_encrypted = encrypt_str(body.k3s_join_token)
-    if body.cluster_join_state is not None:
+    if body.cluster_join_state is not None and _evicted_row_ignores_report(
+        row.cluster_join_state,
+        row.desired_cluster_role,
+        bool(row.evict_requested),
+        body.cluster_join_state,
+    ):
+        # #1317 — an evicted row stays evicted. The replaced node is still
+        # alive and reports its runner's last verdict; applying it turned a
+        # settled ``left`` back into ``failed`` (or, for a member, ``ready``).
+        # Logged once per row and reported state, not per heartbeat: a
+        # replaced member that is still up reports ``ready`` for ever.
+        if _ignored_join_reports_logged.get(row.id) != body.cluster_join_state:
+            _ignored_join_reports_logged[row.id] = body.cluster_join_state
+            logger.info(
+                "control_plane_evicted_node_report_ignored",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                row_state=row.cluster_join_state,
+                reported=body.cluster_join_state,
+            )
+    elif body.cluster_join_state is not None:
+        _ignored_join_reports_logged.pop(row.id, None)
         # #590 — stamp only on a real CHANGE, so the staleness clock the
         # escape hatch keys on measures how long we've been stuck in this
         # state, not how long ago the last heartbeat landed.
@@ -2120,7 +2180,9 @@ async def supervisor_heartbeat(
     # k3s control-plane member that cp-size scaling, MetalLB and quorum math
     # all undercount. Settling on ``cluster_role is None`` makes that
     # self-healing. ``evict_requested`` rows are excluded — a node we are
-    # deliberately evicting must not re-add itself.
+    # deliberately evicting must not re-add itself. (#1317 — nor once the
+    # eviction settled: an evicted row's ``ready`` report is not applied
+    # above, so a row that reads ``left`` never reaches this block.)
     if (
         row.cluster_join_state == CLUSTER_JOIN_STATE_READY
         and not row.evict_requested

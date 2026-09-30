@@ -336,6 +336,26 @@ the formatter handles the rest.
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
 
+- **A replaced node stays replaced: its Fleet row no longer goes
+  back from `left` to `failed` on the node's own word (#1317).**
+  Replace evicts a node on the seed's word and settles its row
+  `left`. The replaced node can still be alive: a failed joiner back
+  on its standalone control plane, or a member that was cut off and
+  returns. It goes on reporting what its join runner last wrote, and
+  the heartbeat applied whatever a node reported. A failed joiner's
+  `failed` turned the settled row back into a failed joiner, so the
+  Fleet showed a node it had just evicted as a failed join again. (A
+  node retries a failed join on its own, so a retry can still be
+  running when Replace is accepted; it reports when it ends.) A
+  member's `ready`, which a node never stops reporting, re-settled
+  the row as a member etcd no longer has. Only the order decided it:
+  the report did no harm when it landed before the eviction settled,
+  and an eviction that settles within seconds (#1284) often settles
+  first. An evicted row now ignores the join state its node reports,
+  from Replace until something is asked of the node again (a new
+  promote). A row an operator cleared mid-join still settles on the
+  node's `ready`, as before.
+
 - **Fleet → Replace removes the node's etcd member, not only its
   k8s Node, and the row settles `left` only once etcd agrees
   (#1284).** The seed evicted a replaced node by deleting its k8s
