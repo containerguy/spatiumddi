@@ -1460,6 +1460,55 @@ the formatter handles the rest.
   so `kubectl apply -f k8s/base/` no longer overwrites a real secret with
   the placeholder.
 
+- **Appliance supervisors verify the control plane's TLS certificate
+  (#1219).** The appliance chart set `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` on
+  the supervisor unconditionally, calling it trust-on-first-use, and nothing
+  was pinned: every register, heartbeat and proxy poll ran with no
+  verification at all. The heartbeat response carries the platform-wide DNS
+  and DHCP agent keys and the slot image URL plus the sha256 that is its only
+  integrity check, so anyone on the path could read the keys and serve a node
+  a root filesystem of their choosing. Now the supervisor pins the
+  certificate the control plane presents at first contact and verifies every
+  connection against it in the TLS handshake (a self-signed control plane
+  works, and the hostname need not match an operator-typed IP). A rotated
+  certificate (re-minted on member join or VIP change, uploaded, or renewed
+  by ACME) is adopted only if the appliance CA, which every approved
+  supervisor already holds, vouches for it through a new unauthenticated
+  `GET /api/v1/appliance/supervisor/tls-pins`: the list of served
+  certificates, signed by the CA. That list names the TLS Secret's
+  certificate as well as the active one, so #1215's revert to the first-boot
+  certificate does not strand supervisors. Once approved, a supervisor also
+  checks that its first-contact pin is on the list, which catches an
+  interception present at pairing (unless it also replaced the CA). The
+  k8s, nettool, pcap and storage proxy loops go through the same pinned
+  trust; before, they verified against system CAs, so against a self-signed
+  control plane they could not connect at all. An `http://` URL is probed
+  once for the `https://` it redirects to, that certificate is pinned, and
+  every request goes straight to the `https://` target, so the pairing code
+  and session token no longer cross the wire in cleartext before the
+  redirect (they used to). Re-pairing with `spatium-pair` forgets the pin and
+  the CA, so an appliance moved to a rebuilt control plane pins the new one
+  rather than refusing it forever. Still open: the
+  DNS, DHCP and looking-glass role pods on an appliance skip verification
+  toward the control plane, which needs the pinned certificate passed
+  through to them (tracked separately).
+  **Upgrade note:** an already-paired appliance takes its pin at its first
+  contact after the upgrade, then checks it against the CA's list; a
+  mismatch is logged as `supervisor.tls.pin_not_vouched`.
+  **Also fixed, because pinning depends on it:** after a control-plane
+  reboot, the frontend kept serving the first-boot certificate. A k3s start
+  puts it back into the TLS Secret (#1215), the frontend pod that starts
+  then loads it, and when the api wrote the active certificate back, the
+  frontend did not roll. The rollout annotation was a checksum of the
+  certificate's content, and restoring the same content left it unchanged.
+  Found on a two-appliance test: after one reboot the control plane served
+  a certificate its own signed list did not name, and the remote appliance
+  refused it on every heartbeat until the frontend was restarted by hand.
+  The annotation now also covers the Secret's `resourceVersion`, which
+  every real write moves, so the write-back rolls the frontend. Browsers
+  stop being shown the first-boot certificate after a reboot as well. The
+  revert itself remains #1215.
+
 - **nmap `extra_args` are an allowlist, and a Network Editor can no longer
   read files through a scan (#1223).** The scan endpoint is gated on
   `manage_nmap_scans`, which the builtin Network Editor role holds, and
