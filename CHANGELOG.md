@@ -1547,6 +1547,40 @@ the formatter handles the rest.
 
 ### Security
 
+- **Setting up two-factor authentication needs a step-up (#1241).**
+  `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
+  that decides whose authenticator the account trusts. A hijacked session
+  could enrol the attacker's: for an SSO superadmin that authenticator then
+  passes every TOTP step-up on the secret reveals (agent bootstrap keys,
+  SNMP communities, provider secrets); for a local user it locks the real
+  owner out, since disabling MFA needs a code only the attacker has. A
+  local user now re-enters their password to start enrolling; an SSO user
+  must have signed in with their identity provider in the last 10 minutes,
+  and is told to sign out and back in otherwise. A token refresh now keeps
+  the session's original sign-in time rather than restamping it, so a
+  stolen session cannot refresh its way into looking recent; the session
+  viewer's "created" column now means when that person signed in. Refused
+  attempts are audited (`mfa.enrol_begin` / `denied`). Wrong answers to any
+  MFA step-up (enrol, disable, regenerate recovery codes) now count toward
+  a per-account budget of 5 per 15 minutes, then `429`: each of those runs
+  for a caller who already holds a session, so unthrottled each was a
+  password oracle for exactly the hijacked session the step-up exists to
+  stop. That budget fails closed: while Redis is unreachable the three
+  step-ups answer `503` with `Retry-After: 60`, because the account
+  lockout counts sign-in answers only and nothing else would bound the
+  guessing. Sign-in is unaffected.
+
+- **External accounts honour their state (#1242).** A **disabled** LDAP,
+  OIDC, SAML, RADIUS or TACACS+ user completed login: tokens, a session row
+  and a `login` / `success` audit row, before every later request was
+  refused. The check now runs before anything is issued or updated, answers
+  `403` (or `?error=account_disabled` on the SSO redirects) and is audited
+  as `denied`. And **"must change password"** on an external account, which
+  has no password here to change, locked it out until an admin cleared the
+  flag: setting it, or resetting the password, on an external account is
+  now refused, and an account that already carries the flag is no longer
+  held to it.
+
 - **Remote agents verify the control plane's certificate by default
   (#1220).** All five `docker-compose.agent-*.yml` files defaulted
   `SPATIUM_INSECURE_SKIP_TLS_VERIFY` to `1`, so an operator who followed
