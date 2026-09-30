@@ -455,6 +455,23 @@ the formatter handles the rest.
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
 
+- **Deleting a DHCP reservation whose client still holds its lease
+  no longer shows the address as free (#1274).** The reserved client's
+  grant arrives while the address is a reservation, which the lease
+  mirror leaves alone, and the delete then freed the row to
+  `available` without looking at the lease. Nothing re-derived it
+  until the DHCP agent sent the lease again (its own restart, a
+  control-plane recovery, or the client's renewal, up to half the
+  lease time later), so IPAM showed a live device's address as free
+  and the next-free allocation could hand it to a second device. When
+  the lease table holds an active lease on the address in that
+  subnet, the delete now makes the row that lease's `dhcp` mirror,
+  linked to it, as if the lease had arrived after the delete. In a
+  DDNS-enabled subnet its A / PTR records are published under the
+  lease's hostname once the reservation is gone, as the lease ingest
+  does, instead of the address staying out of DNS until the renewal.
+  `available` is kept when no active lease holds the address.
+
 - **The version-pin check now sees the Alpine-packaged daemons, and
   no longer reports a pin as behind when it is ahead (#1240).**
   BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
