@@ -2402,6 +2402,8 @@ export interface MfaStatusResponse {
   enrol_requires: "password" | "recent_sign_in";
   /** For `recent_sign_in`: false means sign out and back in first. */
   enrol_sign_in_recent: boolean;
+  /** How recent that sign-in must be, in minutes. */
+  enrol_sign_in_window_minutes: number;
 }
 
 export interface MfaEnrolBeginResponse {

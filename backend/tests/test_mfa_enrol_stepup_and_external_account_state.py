@@ -116,10 +116,12 @@ async def test_local_begin_without_the_password_is_refused_and_audited(
     )
     url = "/api/v1/auth/mfa/enroll/begin"
 
+    # 403, not 401: the SPA reads a 401 as an expired token and would
+    # refresh + resubmit the wrong password.
     r = await client.post(url, headers=headers)
-    assert r.status_code == 401, r.text
+    assert r.status_code == 403, r.text
     r = await client.post(url, headers=headers, json={"password": "wrong"})
-    assert r.status_code == 401, r.text
+    assert r.status_code == 403, r.text
     denied = (
         (
             await db_session.execute(
@@ -151,6 +153,7 @@ async def test_external_begin_needs_a_recent_sign_in(client: AsyncClient, db_ses
     status = (await client.get("/api/v1/auth/mfa/status", headers=stale)).json()
     assert status["enrol_requires"] == "recent_sign_in"
     assert status["enrol_sign_in_recent"] is False
+    assert status["enrol_sign_in_window_minutes"] == MFA_ENROL_SIGN_IN_WINDOW.total_seconds() // 60
 
     _, _, fresh = await _session_user(
         db_session, auth_source="oidc", signed_in_ago=timedelta(minutes=1)
@@ -247,6 +250,8 @@ async def test_a_disabled_external_account_is_refused_before_anything_changes(
             ),
         )
     assert info.value.reason == "account_disabled"
+    # Carried so the caller's denied audit row is linked to the account.
+    assert info.value.user is user
     # Refused BEFORE the refresh: an attempt to use a disabled account does
     # not rewrite its profile or its group membership.
     assert user.email == "old@example.com"
@@ -321,3 +326,41 @@ async def test_an_external_account_already_flagged_is_not_locked_out(
     local.force_password_change = True
     await db_session.commit()
     assert (await client.get("/api/v1/dns/groups", headers=local_headers)).status_code == 403
+
+
+# ── #1241: the step-up is not a password oracle ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_wrong_step_up_answers_are_counted_and_then_refused(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    """The check runs for a caller who already holds a session — the
+    hijacked session it exists to stop — so each wrong answer counts toward
+    a per-account budget, and a spent budget is refused BEFORE the password
+    is checked, so a blocked guess reveals nothing."""
+    import app.api.v1.auth.router as auth_router
+
+    failures: list[object] = []
+    blocked = {"now": False}
+
+    async def _record(user_id: object) -> None:
+        failures.append(user_id)
+
+    async def _blocked(_user_id: object) -> bool:
+        return blocked["now"]
+
+    monkeypatch.setattr(auth_router, "record_stepup_password_failure", _record)
+    monkeypatch.setattr(auth_router, "stepup_password_blocked", _blocked)
+
+    user, _, headers = await _session_user(
+        db_session, auth_source="local", signed_in_ago=timedelta(0), password="pw-123456"
+    )
+    url = "/api/v1/auth/mfa/enroll/begin"
+    assert (await client.post(url, headers=headers, json={"password": "nope"})).status_code == 403
+    assert failures == [user.id]
+
+    blocked["now"] = True
+    r = await client.post(url, headers=headers, json={"password": "pw-123456"})
+    assert r.status_code == 429, r.text
+    assert failures == [user.id]  # the right password was never even checked

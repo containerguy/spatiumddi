@@ -37,11 +37,17 @@ class ExternalAuthResult:
 
 
 class ExternalSyncRejected(Exception):
-    """Raised when we refuse to provision or update a user."""
+    """Raised when we refuse to provision or update a user.
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    ``user`` is the existing account the refusal is about, when there is
+    one, so the caller's ``denied`` audit row is linked to it — filtering
+    the audit log by a disabled account shows the attempts to use it.
+    """
+
+    def __init__(self, reason: str, detail: str = "", *, user: User | None = None) -> None:
         self.reason = reason
         self.detail = detail
+        self.user = user
         super().__init__(detail or reason)
 
 
@@ -116,7 +122,7 @@ async def sync_external_user(
     # disabled account's profile and group membership are not rewritten by
     # an attempt to use it either.
     if user is not None and not user.is_active:
-        raise ExternalSyncRejected("account_disabled", "User account is disabled")
+        raise ExternalSyncRejected("account_disabled", "User account is disabled", user=user)
 
     # 4) Create or refresh.
     if user is None:

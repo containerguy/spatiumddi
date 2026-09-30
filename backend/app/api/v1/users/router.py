@@ -269,6 +269,19 @@ async def update_user(
             detail="Cannot remove your own superadmin status",
         )
 
+    # #1242 — an external account has no local password, so the flag would
+    # lock it out of everything until an admin cleared it again. Clearing it
+    # stays allowed, which is how a row set before this check gets tidied
+    # up. Refused before any field is touched, so a 400 changes nothing.
+    if body.force_password_change and user.auth_source != "local":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"'{user.username}' signs in through {user.auth_source}; its password is "
+                "managed by the identity provider, so it cannot be required to change it here."
+            ),
+        )
+
     if body.display_name is not None:
         user.display_name = body.display_name
     if body.email is not None:
@@ -278,18 +291,6 @@ async def update_user(
     if body.is_superadmin is not None:
         user.is_superadmin = body.is_superadmin
     if body.force_password_change is not None:
-        # #1242 — an external account has no local password, so the flag
-        # would lock it out of everything until an admin cleared it again.
-        # Clearing it stays allowed, which is how a row set before this
-        # check gets tidied up.
-        if body.force_password_change and user.auth_source != "local":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"'{user.username}' signs in through {user.auth_source}; its password is "
-                    "managed by the identity provider, so it cannot be required to change it here."
-                ),
-            )
         user.force_password_change = body.force_password_change
 
     db.add(_audit(current_user, "update", str(user.id), f"Updated user {user.username}"))
@@ -317,7 +318,8 @@ async def reset_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 f"'{user.username}' signs in through {user.auth_source}; reset the password "
-                "in the identity provider."
+                "in the identity provider. To end its sessions here, disable the account or "
+                "revoke them from Sessions."
             ),
         )
 

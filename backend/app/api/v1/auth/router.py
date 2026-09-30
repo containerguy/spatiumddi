@@ -41,7 +41,12 @@ from app.core.auth.user_sync import (
     ExternalSyncRejected,
     sync_external_user,
 )
-from app.core.auth_throttle import login_rate_limited, mfa_challenge_consume
+from app.core.auth_throttle import (
+    login_rate_limited,
+    mfa_challenge_consume,
+    record_stepup_password_failure,
+    stepup_password_blocked,
+)
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import effective_grants, is_effective_superadmin
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
@@ -510,6 +515,7 @@ async def _try_external_password_login(
                 username,
                 reason=exc.reason,
                 auth_source=provider.name,
+                user=exc.user,
             )
             if exc.reason == "account_disabled":
                 # Same answer the local path gives a disabled account. The
@@ -1065,6 +1071,13 @@ class MfaStatusResponse(BaseModel):
     #: enough. False means sign out and back in first. Always true for
     #: ``password``, which does not depend on it.
     enrol_sign_in_recent: bool
+    #: How recent that sign-in must be, in minutes — so the UI states the
+    #: server's window rather than a copy of it.
+    enrol_sign_in_window_minutes: int
+
+
+def _enrol_window_minutes() -> int:
+    return int(MFA_ENROL_SIGN_IN_WINDOW.total_seconds() // 60)
 
 
 @router.get("/mfa/status", response_model=MfaStatusResponse)
@@ -1072,16 +1085,30 @@ async def mfa_status(current_user: CurrentUser, request: Request) -> MfaStatusRe
     """Surface current MFA state for the Settings panel. ``enrolment_pending``
     is True when the operator has called ``begin`` but not ``verify`` —
     handy for the UI to render a "Resume enrolment" affordance."""
+    local = uses_local_password(current_user)
     return MfaStatusResponse(
         enabled=current_user.totp_enabled,
         enrolment_pending=(
             not current_user.totp_enabled and current_user.totp_secret_encrypted is not None
         ),
         recovery_codes_remaining=remaining_recovery_codes(current_user.recovery_codes_encrypted),
-        enrol_requires="password" if uses_local_password(current_user) else "recent_sign_in",
-        enrol_sign_in_recent=uses_local_password(current_user)
+        enrol_requires="password" if local else "recent_sign_in",
+        enrol_sign_in_recent=local
         or sign_in_is_recent(getattr(request.state, "signed_in_at", None)),
+        enrol_sign_in_window_minutes=_enrol_window_minutes(),
     )
+
+
+async def _refuse_if_stepup_blocked(user: User) -> None:
+    """429 once the account has spent its wrong-answer budget on MFA
+    step-ups (#1241). These run for a caller who already holds a session —
+    the hijacked session they exist to stop — so unthrottled, each is an
+    oracle for the password (or, on disable / regenerate, the TOTP code)."""
+    if await stepup_password_blocked(user.id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many incorrect attempts. Try again in 15 minutes.",
+        )
 
 
 @router.post("/mfa/enroll/begin", response_model=MfaEnrolBeginResponse)
@@ -1114,11 +1141,14 @@ async def mfa_enroll_begin(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MFA is already enabled — disable it first to re-enrol",
         )
+    await _refuse_if_stepup_blocked(current_user)
     outcome = reverify_for_mfa_enrolment(
         current_user,
         password=body.password if body else None,
         signed_in_at=getattr(request.state, "signed_in_at", None),
     )
+    if outcome is ReauthOutcome.BAD_CREDENTIAL:
+        await record_stepup_password_failure(current_user.id)
     if outcome is not ReauthOutcome.OK:
         db.add(
             AuditLog(
@@ -1137,15 +1167,19 @@ async def mfa_enroll_begin(
         )
         await db.commit()
         if outcome is ReauthOutcome.SIGN_IN_TOO_OLD:
-            minutes = int(MFA_ENROL_SIGN_IN_WINDOW.total_seconds() // 60)
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
                     "Setting up two-factor authentication needs a recent sign-in. "
-                    f"Sign out, sign in again, and start within {minutes} minutes."
+                    f"Sign out, sign in again, and start within {_enrol_window_minutes()} "
+                    "minutes."
                 ),
             )
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        # 403, not 401, like the reveal step-ups: the SPA's axios interceptor
+        # reads any 401 off a non-login path as an expired access token, so
+        # a mistyped password would rotate the session and resubmit it —
+        # two ``denied`` audit rows and two bcrypt checks per typo.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Incorrect password")
     secret = generate_secret()
     codes = generate_recovery_codes()
     current_user.totp_secret_encrypted = encrypt_secret(secret)
@@ -1212,13 +1246,17 @@ async def mfa_disable(
         )
     # Password is required + checked ONLY for local accounts (which have
     # one). External-auth accounts re-confirm with the TOTP code alone.
-    if current_user.auth_source == "local" and current_user.hashed_password:
+    await _refuse_if_stepup_blocked(current_user)
+    if uses_local_password(current_user):
+        assert current_user.hashed_password is not None  # narrowed by uses_local_password
         if not body.password or not verify_password(body.password, current_user.hashed_password):
+            await record_stepup_password_failure(current_user.id)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
             )
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
+        await record_stepup_password_failure(current_user.id)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
     current_user.totp_enabled = False
     current_user.totp_secret_encrypted = None
@@ -1257,13 +1295,17 @@ async def mfa_regenerate_recovery_codes(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is not currently enabled"
         )
-    if current_user.auth_source == "local" and current_user.hashed_password:
+    await _refuse_if_stepup_blocked(current_user)
+    if uses_local_password(current_user):
+        assert current_user.hashed_password is not None  # narrowed by uses_local_password
         if not body.password or not verify_password(body.password, current_user.hashed_password):
+            await record_stepup_password_failure(current_user.id)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
             )
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
+        await record_stepup_password_failure(current_user.id)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
     codes = generate_recovery_codes()
     current_user.recovery_codes_encrypted = encrypt_recovery_codes(codes)
@@ -1593,6 +1635,7 @@ async def oidc_callback(
             result.username or result.external_id,
             reason=exc.reason,
             auth_source=provider.name,
+            user=exc.user,
         )
         if exc.reason == "account_disabled":
             return _login_error_redirect("account_disabled")
@@ -1687,6 +1730,7 @@ async def saml_callback(
             consumed.result.username or consumed.result.external_id,
             reason=exc.reason,
             auth_source=provider.name,
+            user=exc.user,
         )
         if exc.reason == "account_disabled":
             return _login_error_redirect("account_disabled")

@@ -71,9 +71,10 @@ session alone doesn't prove and an SSO account has no local password.
   refresh carries forward rather than restamps, so a stolen session cannot
   refresh its way into looking recent; a request with no session (an API
   token) fails closed. `GET /auth/mfa/status` reports which one applies
-  (`enrol_requires`) and whether the current sign-in is still recent
-  (`enrol_sign_in_recent`). A refused attempt is audited as
-  `mfa.enrol_begin` / `denied`.
+  (`enrol_requires`), whether the current sign-in is still recent
+  (`enrol_sign_in_recent`) and the window itself
+  (`enrol_sign_in_window_minutes`). A refused attempt answers `403` and is
+  audited as `mfa.enrol_begin` / `denied`.
 - **Login flow**: when MFA is enabled, the `POST /auth/login` response
   carries a short-lived **pre-token** instead of the full access token.
   The UI prompts for either a 6-digit TOTP code or a backup code and

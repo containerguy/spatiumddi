@@ -82,6 +82,9 @@ function MfaPanel() {
   const needsPassword = status?.enrol_requires === "password";
   const signInTooOld =
     status?.enrol_requires === "recent_sign_in" && !status.enrol_sign_in_recent;
+  // With no status there is no way to know which step-up applies, so the
+  // button stays disabled rather than guessing "none" and sending a local
+  // user's begin without a password.
 
   return (
     <div className="rounded-lg border bg-card">
@@ -128,7 +131,7 @@ function MfaPanel() {
               <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
                 Setting up two-factor authentication needs a recent sign-in.
                 Sign out, sign in again through your identity provider, and
-                start within 10 minutes.
+                start within {status?.enrol_sign_in_window_minutes} minutes.
               </p>
             )}
             <button
@@ -138,7 +141,7 @@ function MfaPanel() {
                   ? setAskPassword(true)
                   : enrollBegin.mutate(undefined)
               }
-              disabled={enrollBegin.isPending || signInTooOld}
+              disabled={!status || enrollBegin.isPending || signInTooOld}
               className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {enrollBegin.isPending ? "Generating…" : "Set up authenticator"}

@@ -63,6 +63,11 @@ def _totp_ok(user: User, code: str | None) -> bool:
         return False
 
 
+def uses_local_password(user: User) -> bool:
+    """True for an account whose step-ups prove a local password."""
+    return bool(user.auth_source == "local" and user.hashed_password)
+
+
 def reverify_operator(
     user: User,
     *,
@@ -74,8 +79,7 @@ def reverify_operator(
     Never raises on a bad credential — returns an outcome so the caller keeps
     its own audit-on-denial + friction-sleep behaviour.
     """
-    has_local_password = bool(user.auth_source == "local" and user.hashed_password)
-    if has_local_password:
+    if uses_local_password(user):
         # SECURITY (review of #408): a local user must prove their PASSWORD —
         # TOTP is NOT accepted as a substitute here. Accepting TOTP-in-lieu-of-
         # password would be a defense-in-depth downgrade: TOTP proves only
@@ -84,7 +88,7 @@ def reverify_operator(
         # users already hold the strongest factor (password); only
         # password-less SSO users fall back to TOTP below — which is why
         # enrolment itself now needs a step-up (#1241).
-        assert user.hashed_password is not None  # narrowed by has_local_password
+        assert user.hashed_password is not None  # narrowed by uses_local_password
         if password and verify_password(password, user.hashed_password):
             return ReauthOutcome.OK
         return ReauthOutcome.BAD_CREDENTIAL
@@ -103,10 +107,6 @@ def reverify_operator(
 
 #: How recent an external-auth user's sign-in must be to enrol MFA (#1241).
 MFA_ENROL_SIGN_IN_WINDOW = timedelta(minutes=10)
-
-
-def uses_local_password(user: User) -> bool:
-    return bool(user.auth_source == "local" and user.hashed_password)
 
 
 def sign_in_is_recent(signed_in_at: datetime | None, *, now: datetime | None = None) -> bool:
