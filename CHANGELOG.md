@@ -1480,7 +1480,12 @@ the formatter handles the rest.
   the session's original sign-in time rather than restamping it, so a
   stolen session cannot refresh its way into looking recent; the session
   viewer's "created" column now means when that person signed in. Refused
-  attempts are audited (`mfa.enrol_begin` / `denied`).
+  attempts are audited (`mfa.enrol_begin` / `denied`). Wrong answers to any
+  MFA step-up (enrol, disable, regenerate recovery codes) now count toward
+  a per-account budget of 5 per 15 minutes, then `429`: each of those runs
+  for a caller who already holds a session, so unthrottled each was a
+  password oracle for exactly the hijacked session the step-up exists to
+  stop.
 
 - **External accounts honour their state (#1242).** A **disabled** LDAP,
   OIDC, SAML, RADIUS or TACACS+ user completed login: tokens, a session row

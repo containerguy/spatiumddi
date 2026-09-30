@@ -74,7 +74,12 @@ session alone doesn't prove and an SSO account has no local password.
   (`enrol_requires`), whether the current sign-in is still recent
   (`enrol_sign_in_recent`) and the window itself
   (`enrol_sign_in_window_minutes`). A refused attempt answers `403` and is
-  audited as `mfa.enrol_begin` / `denied`.
+  audited as `mfa.enrol_begin` / `denied`. Wrong answers to any MFA step-up
+  (begin, disable, regenerate recovery codes) count toward a per-account
+  budget of 5 per 15 minutes, after which the step-up answers `429` without
+  checking the credential: these run for a caller who already holds a
+  session, so unthrottled each would be a password oracle. The budget lives
+  in Redis and fails open, like the login throttle.
 - **Login flow**: when MFA is enabled, the `POST /auth/login` response
   carries a short-lived **pre-token** instead of the full access token.
   The UI prompts for either a 6-digit TOTP code or a backup code and
