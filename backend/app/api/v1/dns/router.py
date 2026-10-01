@@ -4625,6 +4625,10 @@ class PendingOpEntry(BaseModel):
     last_error: str | None
     created_at: datetime
     applied_at: datetime | None
+    # #1232 — when a backing-off op may ship again (NULL = now), and the
+    # newer op a ``superseded`` one was retired in favour of.
+    next_attempt_at: datetime | None = None
+    superseded_by: uuid.UUID | None = None
 
 
 class PendingOpsResponse(BaseModel):
@@ -4644,7 +4648,7 @@ async def get_server_pending_ops(
 
     Drives the Server Detail modal's "Sync" tab. The counts dict has
     one key per state value (``pending``, ``in_flight``, ``applied``,
-    ``failed``). Items are ordered by ``created_at DESC`` and capped
+    ``failed``, ``superseded``). Items are ordered by ``created_at DESC`` and capped
     at ``limit``.
     """
     from app.models.dns import DNSRecordOp  # noqa: PLC0415
@@ -4678,6 +4682,8 @@ async def get_server_pending_ops(
             last_error=op.last_error,
             created_at=op.created_at,
             applied_at=op.applied_at,
+            next_attempt_at=op.next_attempt_at,
+            superseded_by=op.superseded_by,
         )
         for op in ops_res.scalars().all()
     ]
