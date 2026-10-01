@@ -248,6 +248,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **External URLs from PeeringDB are linked only when they are http
+  or https (#1361).** The website and looking-glass fields on an ASN's
+  BGP footprint tab went into a link whatever their scheme. Now only an
+  `http:` or `https:` URL becomes a link; anything else, including a
+  `telnet:` or `ssh:` looking glass, is shown as plain text. The values
+  are also checked when they are fetched: a website is kept only if it
+  is http(s), and a looking glass only if it is http(s), telnet or ssh,
+  the schemes PeeringDB itself accepts. The GitHub release links on the
+  sidebar and the Releases tab are also linked only when http(s).
+
 - **The backup docs no longer say an archive is encrypted (#1352).**
   Only `secrets.enc` inside a backup archive is passphrase-wrapped;
   the database dump next to it is not. SYSTEM_ADMIN.md said otherwise
