@@ -248,6 +248,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Hetzner DNS driver talks to the Hetzner Cloud API.** Hetzner
+  retired the standalone DNS Console API, which now answers every call
+  with a `301` redirect to the Cloud Console's web UI, so the driver failed
+  every probe, import and write with a bare "Hetzner API error: HTTP 301"
+  and no zone could be managed. It now drives `api.hetzner.cloud/v1` with
+  a Cloud **project** token (`Authorization: Bearer`, Read & Write to
+  apply changes) — a token from the old DNS Console does not work, so an
+  existing Hetzner server needs its token replaced. The Cloud API is
+  RRset-oriented, so an op carrying the resolved set (#783) is one
+  `set_records` write and replaying it converges; the per-value fallback
+  uses `add_records` / `remove_records` against the live set. Writes are
+  asynchronous actions and are now awaited, so a change the API rejects
+  after accepting it is reported as failed rather than applied. TXT values
+  are quoted on write and joined on read, hostname targets are
+  absolutised, and secondary-mode zones (AXFR'd from your own primaries)
+  are no longer offered for import, since they have no RRsets to manage.
+  A redirect is reported as such instead of as "HTTP 301".
+
 - **The privacy statement lists the public resolvers PowerDNS
   uses, and its guard now scans the agents too (#1353).** The agent
   renders `resolver=1.1.1.1,8.8.8.8` into every PowerDNS server's
