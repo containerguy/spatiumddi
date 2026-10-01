@@ -248,6 +248,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An unknown URL shows a "Page not found" page instead of a blank
+  screen (#1360).** The route table had no catch-all, so a mistyped
+  or stale URL matched nothing and rendered an empty page with no
+  sidebar and no way back. A signed-out user on such a URL was not
+  sent to the login page either, because the login check never ran.
+  The new page renders inside the app, shows the requested path as
+  plain text, and links back to the dashboard. It also suggests a few
+  pages from the sidebar's own list, closest to the mistyped path
+  first, and skips any whose feature is turned off (Settings →
+  Features). Signed-out users now go to the login page. Also: the
+  legacy `/network/<id>` bookmark route matched any `/network/...`
+  typo and looked it up as a device. It now redirects a real device id
+  to `/network/devices/<id>`, which its comment always said it did,
+  and shows the 404 page for anything else.
+
 - **External URLs from PeeringDB are linked only when they are http
   or https (#1361).** The website and looking-glass fields on an ASN's
   BGP footprint tab went into a link whatever their scheme. Now only an
