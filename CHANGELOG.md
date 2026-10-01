@@ -248,6 +248,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The backup docs no longer say an archive is encrypted (#1352).**
+  Only `secrets.enc` inside a backup archive is passphrase-wrapped;
+  the database dump next to it is not. SYSTEM_ADMIN.md said otherwise
+  in three places: that an unauthenticated NFS export exposes only
+  archive names and sizes, that LUKS on a removable backup disk is
+  optional because the archive is already encrypted, and that the
+  least-privilege pull token "fetches ciphertext". The NFS destination
+  form carried the same claim. Anyone who can read an archive can read
+  the whole database, users, IPAM / DNS / DHCP data and the audit log
+  included. Most stored credentials stay encrypted under the source
+  install's key, but not each DNS server group's internal TSIG key,
+  which is stored in clear and is accepted for zone transfers and
+  dynamic updates from any address (encrypting it is #1364). The docs
+  now say what an archive exposes, the NFS section says to restrict
+  the export, and the removable-disk section no longer recommends
+  LUKS: the appliance refuses a `crypto_LUKS` disk, having no
+  `cryptsetup` to unlock it.
+
 - **A restore no longer stamps a half-migrated schema as current
   (#1233).** When `alembic upgrade head` failed after a restore with
   "already exists", from any revision, the restore ran `alembic stamp
