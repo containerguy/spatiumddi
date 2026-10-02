@@ -2421,6 +2421,10 @@ export interface AppUser {
   is_superadmin: boolean;
   force_password_change: boolean;
   auth_source: string;
+  /** The provider an external account belongs to (#1235). Null for a local
+   *  account, and for an external one not attributed to a provider, which
+   *  cannot sign in until it is linked (``usersApi.linkProvider``). */
+  auth_provider_id?: string | null;
   last_login_at: string | null;
   /** Lockout state (issue #71). ``locked`` is the live time check;
    *  ``failed_login_locked_until`` is the wall-clock target so the UI
@@ -2459,6 +2463,15 @@ export const usersApi = {
     api.post(`/users/${id}/reset-password`, { new_password: newPassword }),
   /** Clear lockout state on a user account (issue #71). */
   unlock: (id: string) => api.post(`/users/${id}/unlock`),
+  /** Link an external account to its provider (#1235). Clears the stored
+   *  external id; the next sign-in through that provider with the
+   *  account's username claims it. */
+  linkProvider: (id: string, authProviderId: string) =>
+    api
+      .post<AppUser>(`/users/${id}/link-provider`, {
+        auth_provider_id: authProviderId,
+      })
+      .then((r) => r.data),
   delete: (id: string) => api.delete(`/users/${id}`),
 };
 

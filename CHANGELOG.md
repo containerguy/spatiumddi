@@ -2066,6 +2066,62 @@ the formatter handles the rest.
 
 ### Security
 
+- **A second provider of the same type can no longer sign in as another
+  provider's user (#1235).** External accounts were matched on
+  `(auth_source, external_id)`, and `auth_source` is the provider's
+  type, not the provider. On a miss, an account of the same type with
+  the same username was adopted. So with two LDAP domains or two OIDC
+  IdPs configured, whoever held `jsmith` in the second one signed in as
+  the first one's `jsmith`, superadmin flag and all; an identical OIDC
+  `sub` from two IdPs did the same without any username at all. Now an
+  external account belongs to one provider (`user.auth_provider_id`,
+  migration `f4a8c2e71d09`), a login matches on the provider and its
+  external id, and **an account is never adopted by username alone**:
+  a taken username is refused as `username_collision`.
+  - **Upgrade note.** The migration attributes existing accounts only
+    where it can prove the provider: RADIUS / TACACS+ external ids name
+    it, and an LDAP / OIDC / SAML account is attributed when its type has
+    exactly one provider **and** the account cannot have come from another
+    one: it was created after that provider, and after the last deletion of
+    any other provider of its type (read from the audit log, which must
+    also hold the surviving provider's own `create` row; an audit log
+    restored without its section attributes nothing). A disabled
+    provider counts: one enabled and one disabled provider of a type is two,
+    and links nothing. Anything else is left unlinked and is refused
+    (`account_link_required`) until an administrator links it from
+    **Users → Edit → Sign-in provider** (`POST /users/{id}/link-provider`,
+    audited as `user.provider_linked`). The Users page marks those accounts
+    **unlinked**, and `list_users` reports their provider as null.
+  - **A deleted provider's accounts are not handed to its successor
+    (found by QA on #1289).** Released builds kept a deleted provider's accounts with
+    their identifier intact, so "one provider of the type exists now" did
+    not mean "only one ever did". An earlier draft of this fix linked such
+    an account to the surviving provider, both at upgrade and at sign-in,
+    so the survivor's subject with the same `sub` or DN signed in as it.
+    The backfill now checks the audit log as above, and the sign-in path
+    never links an unlinked account itself: it always refuses with
+    `account_link_required`, and the refusal's audit row names the account.
+  - **Behaviour change.** A user whose identifier at the provider changes,
+    such as an LDAP DN after an OU move, was re-attached by username and
+    is now refused until an administrator links the account again. The
+    link clears the stored identifier, and the next sign-in as that
+    username through that provider claims it; it also revokes the
+    account's sessions. Deleting a provider clears its accounts'
+    identifiers too, so a replacement provider of the same type that
+    issues the same `sub` or DN cannot adopt them. It also revokes their
+    sessions, and an administrator cannot delete the provider their own
+    account signs in through (409), which would lock them out.
+  - **SAML needs a stable NameID.** The NameID is the account's key at its
+    provider, and a transient one is new on every sign-in: it used to be
+    re-attached by username, which is the adoption this fix removes. A
+    transient NameID is now refused at the ACS with a message naming the
+    fix: configure the IdP to release a persistent or emailAddress NameID.
+  - On the password grant, a provider that accepts the password but whose
+    subject does not own the account no longer ends the login: the next
+    provider by priority still gets its turn, so a higher-priority
+    directory that also knows the user cannot lock out the account's
+    own provider.
+
 - **A started MFA enrolment is budgeted and expires (#1354).** The first
   code at `POST /auth/mfa/enroll/verify` had no attempt limit, and a
   started enrolment never expired and survived sign-out and a password

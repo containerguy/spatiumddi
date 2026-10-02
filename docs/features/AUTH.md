@@ -147,6 +147,60 @@ sets `SECRET_KEY` still works. See `backend/app/core/crypto.py`.
 `backend/app/core/auth/user_sync.py` resolves the user's provider-reported
 groups case-insensitively and **rejects the login if no mapping matches**.
 
+**An external account belongs to one provider** ([#1235](https://github.com/spatiumnorth/spatiumddi/issues/1235)).
+`user.auth_provider_id` records it, and a login matches on
+`(auth_provider_id, external_id)`: the LDAP DN, OIDC `sub`, SAML `NameID`,
+or `<provider id>:<username>` for RADIUS / TACACS+. It used to match on
+`(auth_source, external_id)`, and `auth_source` is the provider's *type*,
+so with two LDAP domains or two OIDC IdPs configured a subject from the
+second signed in as the first one's user of the same name, superadmin flag
+included. Two providers of one type are two authorities; an identifier from
+one says nothing about the other.
+
+In order, a login through provider P as subject S with username U:
+
+1. signs in as the account linked to P with external id S;
+2. else claims the account an administrator linked to P
+   (`POST /users/{id}/link-provider`) whose username is U and which has not
+   signed in since the link;
+3. else, for an account from before `auth_provider_id` existed (NULL, same
+   type, external id S), refuses with `account_link_required` until an
+   administrator links it. The login never links such an account itself:
+   one provider of the type existing *now* does not show that only one ever
+   did, and a deleted provider's accounts kept their identifiers in
+   released builds;
+4. else refuses with `username_collision` if any other account holds U;
+5. else provisions a new account under P (if `auto_create_users`).
+
+On the password grant (LDAP / RADIUS / TACACS+), a refusal at step 3 or 4
+does not end the login: the next provider by priority still gets its turn,
+so an account owned by a lower-priority provider is not locked out by a
+higher-priority one that also accepts the same username and password.
+
+An account is **never adopted by username alone**, whatever its source. So
+a user whose identifier at the provider changed — an LDAP DN after an OU
+move — is refused until an administrator links the account again from
+**Users → Edit → Sign-in provider**. Linking clears the stored identifier,
+and the next sign-in through that provider as the account's username claims
+it; the link also revokes every session the account holds. Deleting a
+provider clears its accounts' identifiers as well as their provider, so a
+new provider of the same type issuing the same `sub` / DN never adopts one
+— they wait for an administrator's link. Deleting a provider also revokes
+those accounts' sessions, and is refused (`409`) for the administrator whose
+own account signs in through it. A local account cannot be linked: it has a password, and linking it
+would hand it to whoever holds the same username at the provider. The
+upgrade attributes existing accounts where it can prove the provider (a
+RADIUS / TACACS+ external id names it; an LDAP / OIDC / SAML account is
+attributed when its type has exactly one provider, the account was created
+after that provider, and no other provider that may have been of its type
+was deleted after the account was created, read from the `audit_log`
+`create` / `delete` rows; an audit log missing the survivor's own `create`
+row, as after a restore without it, attributes nothing), and leaves the rest
+for an administrator. A
+**disabled** provider still counts as a provider of its type: with one
+enabled and one disabled LDAP provider, the upgrade links no LDAP account. They show an **unlinked** chip on the Users page, and
+`list_users` reports their `auth_provider` as null.
+
 ### LDAP
 
 Driver: `backend/app/core/auth/ldap.py` (`ldap3`).
@@ -225,6 +279,14 @@ Key config fields:
 | `attr_username` / `attr_email` / `attr_display_name` / `attr_groups` | SAML attribute names. |
 
 Secrets: `sp_private_key` (PEM, optional — only needed for signed requests).
+
+**The IdP must release a stable NameID.** The NameID is the account's key at
+its provider (`external_id`), so it must name the same user on every
+sign-in: `persistent` or `emailAddress` (SpatiumDDI requests the latter). A
+**transient** NameID is new each time and is refused at the ACS with a
+message saying so; without that refusal the first sign-in would create an
+account that every later one is refused, since its username is then taken
+and an account is never adopted by username.
 
 **SAML needs HTTPS with any hosted IdP.** Step 2 above is a *cross-site
 POST*: the browser is on the IdP's origin and submits the assertion to
@@ -585,13 +647,16 @@ rather than swallowing the failure. Permission-related rejections
   deliberately strict — there is no implicit "default group" fallback.
   `backend/app/core/auth/user_sync.py`.
 - **Auto-create disabled.** First external login for a new subject is
-  refused with `401` if `provider.auto_create_users=False`. An
-  administrator must create the `User` row manually.
+  refused with `401` if `provider.auto_create_users=False`: the provider
+  then signs in only accounts already linked to it.
   `backend/app/core/auth/user_sync.py`.
-- **Username collision across auth sources.** An external user whose
-  `external_id` is new but whose preferred username already belongs to
-  a user on a different `auth_source` is rejected to prevent silently
-  hijacking an existing account.
+- **Username collision.** An external subject not linked to an account,
+  whose username already belongs to any account — local, or linked to
+  another provider — is rejected (`username_collision`) rather than
+  adopting it (#1235). `backend/app/core/auth/user_sync.py`.
+- **Account not linked.** An account from before provider linking that
+  the upgrade could not attribute is rejected (`account_link_required`)
+  until an administrator links it; the denied audit row names the account.
   `backend/app/core/auth/user_sync.py`.
 - **Refresh token invalid or expired.** Refresh is rejected with `401`
   when the token is not in the sessions table, has been revoked, or
