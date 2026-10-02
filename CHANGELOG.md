@@ -2022,6 +2022,21 @@ the formatter handles the rest.
 
 ### Security
 
+- **A started MFA enrolment is budgeted and expires (#1354).** The first
+  code at `POST /auth/mfa/enroll/verify` had no attempt limit, and a
+  started enrolment never expired and survived sign-out and a password
+  change. So an abandoned enrolment stayed open to unlimited 6-digit
+  guesses from any of the user's sessions, and a hit turned MFA on with a
+  secret the user never saw, locking a local user out until an admin
+  reset it. Verify now spends the same fail-closed step-up budget as
+  begin, disable and regenerate (`429` when spent, `503` while it cannot
+  be read), claimed atomically before the code is checked so concurrent
+  guesses cannot all slip under it. A wrong code answers `403`, not `401`,
+  so the UI does not resubmit and count it twice. A started enrolment
+  expires after 15 minutes (verify answers `400` and discards it), and
+  sign-out, a password change or an admin password reset discards it too. No migration: the start time is the
+  candidate secret's own Fernet timestamp.
+
 - **The api image no longer ships pip (#1392).** The runtime image
   carried the Python base image's own pip 25.0.1, which has six fixed
   CVEs (five MEDIUM, one LOW). Our release gate scans HIGH and CRITICAL
