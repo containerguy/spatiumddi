@@ -296,6 +296,24 @@ the formatter handles the rest.
   and pages in SQL, and counts batch sizes for the shown rows only.
   The search stays a literal substring match.
 
+- **Restoring a large zone from the Trash no longer scales with the
+  zone either (#1389).** Restore still had the old shape: one conflict
+  `SELECT` per record and one audit row per record, so bringing back a
+  250k-record zone was 250k of each in one request, blocking every
+  other audited change. The conflicts are now found by one query for
+  the whole batch, the zone's records come back by one `UPDATE`, and
+  the zone's own restore row records how many (`new_value.restored`).
+  The response's `restored` count still includes them. The conflict
+  check now uses the identity record create refuses a duplicate on
+  (#1230): the view, the name compared case-insensitively, the type,
+  the value after trimming, and priority, weight and port. So a record
+  in another view, or an MX or SRV at another priority or port, no
+  longer blocks the restore (neither was ever a duplicate), while a
+  restore can no longer bring back a twin that differs from a live
+  record only in letter case or surrounding spaces. A #963 bulk record
+  delete still restores record by record, since each record is
+  re-pushed to agentless providers.
+
 - **Cluster health no longer counts a joining database replica as a
   ready instance (#1213).** The workload rollup on
   `GET /appliance/cluster/health` skipped only finished Job pods, so
