@@ -98,6 +98,19 @@ jobs:
           ls -lh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/*.tar.zst
           du -sh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/
 
+      - name: Swap the generic arm64 kernel for the RPi kernel in the arch drop-in
+        # The rpi5 profile's ``RemovePackages=linux-image-arm64`` removes only
+        # the METAPACKAGE; the concrete linux-image-<ver>-arm64 it pulled in
+        # stays installed, so the image carries two kernels and /boot/vmlinuz
+        # can point at the generic one (no RP1 NIC). Install only the RPi
+        # kernel in the first place — what the working nightly build did.
+        run: |
+          set -euo pipefail
+          f=appliance/mkosi.conf.d/10-arm64.conf
+          grep -q '^\s*linux-image-arm64\s*$' "$f" || { echo "::error::$f has no linux-image-arm64 line to swap"; exit 1; }
+          sed -i 's/^\(\s*\)linux-image-arm64\s*$/\1linux-image-rpi-2712/' "$f"
+          cat "$f"
+
       - name: Build the appliance builder from this tag
         run: docker build -t spatiumddi-appliance-builder:local appliance/builder
 
@@ -130,10 +143,22 @@ jobs:
           [ -n "$found" ] || { echo "::error::no root filesystem found in $RAW"; exit 1; }
           KVER=$(ls /mnt/root/usr/lib/modules 2>/dev/null || ls /mnt/root/lib/modules)
           echo "Kernel(s): $KVER"
-          echo "$KVER" | grep -q "rpi-2712" || { echo "::error::kernel is not the RPi 2712 kernel — rpi5 profile not applied"; exit 1; }
-          if dpkg-query --admindir=/mnt/root/var/lib/dpkg -W 'linux-image-arm64' >/dev/null 2>&1; then
-            echo "::error::generic linux-image-arm64 is installed alongside the RPi kernel"; exit 1
+          # Exactly one kernel, and it is the RPi 2712 one.
+          [ "$(echo "$KVER" | wc -l)" -eq 1 ] || { echo "::error::expected exactly one kernel, found: $KVER"; exit 1; }
+          echo "$KVER" | grep -q "rpi-2712" || { echo "::error::kernel is not the RPi 2712 kernel"; exit 1; }
+          # Installed image packages (status 'ii'), not merely known to dpkg.
+          IMGS=$(dpkg-query --admindir=/mnt/root/var/lib/dpkg -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-*' 2>/dev/null | awk '$1=="ii"{print $2}')
+          echo "Installed kernel packages: $IMGS"
+          if echo "$IMGS" | grep -E -- '-arm64$' | grep -q .; then
+            echo "::error::a generic arm64 kernel package is installed: $IMGS"; exit 1
           fi
+          # What GRUB actually boots.
+          VMLINUZ=$(readlink /mnt/root/boot/vmlinuz || true)
+          echo "/boot/vmlinuz -> $VMLINUZ"
+          echo "$VMLINUZ" | grep -q "rpi-2712" || { echo "::error::/boot/vmlinuz does not point at the RPi kernel"; exit 1; }
+          INITRD=$(readlink /mnt/root/boot/initrd.img || true)
+          echo "/boot/initrd.img -> $INITRD"
+          echo "$INITRD" | grep -q "rpi-2712" || { echo "::error::/boot/initrd.img does not point at the RPi initrd"; exit 1; }
           grep -q 'APPLIANCE_PROFILE="rpi5"' /mnt/root/etc/spatiumddi/appliance-release \
             || { echo "::error::appliance-release lacks APPLIANCE_PROFILE=rpi5"; exit 1; }
           DTB=$(sudo find /mnt/root/usr/lib /mnt/root/boot -name 'bcm2712-rpi-5-b.dtb' 2>/dev/null | grep -F "$(echo "$KVER" | head -1)" | head -1 || true)
