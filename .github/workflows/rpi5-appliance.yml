@@ -1,0 +1,185 @@
+name: Build Raspberry Pi 5 appliance slot image (fork only)
+
+# Builds the SpatiumDDI appliance slot image for a Raspberry Pi 5 with the
+# ``rpi5`` mkosi profile (RPi downstream kernel, so the RP1 onboard NIC works —
+# upstream PR #1330), at the release tag this branch was cut from. Same steps as
+# the upstream reusable ``build-appliance.yml`` (arm64 leg), with three
+# deliberate differences:
+#
+#   * images and the builder context come from ghcr.io/spatiumnorth — in a fork
+#     ``github.repository_owner`` is the fork owner, which publishes nothing;
+#   * ``--profile rpi5`` and ``APPLIANCE_PROFILE="rpi5"`` in appliance-release,
+#     so the flavour guard from #1330 recognises the image as a Pi image;
+#   * the result is attached to a pre-release IN THIS FORK, together with the
+#     kernel's Pi 5 device tree, which has to be copied onto the NVMe ESP next to
+#     the EDK2 firmware when the kernel version changes.
+#
+# Only runs in a fork, only on a push to a ``build/rpi5-*`` branch (or by hand).
+# Nothing here touches the upstream repository.
+
+on:
+  push:
+    branches: ["build/rpi5-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the fork pre-release
+  packages: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/spatiumnorth
+  VERSION: "2026.10.02-1"
+  ARCH: arm64
+  PROFILE: rpi5
+
+concurrency:
+  group: rpi5-appliance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build rpi5 slot image (${{ github.ref_name }})
+    if: github.repository_owner != 'spatiumnorth'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stamp /etc/spatiumddi/appliance-release
+        run: |
+          set -euo pipefail
+          mkdir -p appliance/mkosi.extra/etc/spatiumddi
+          {
+            echo "APPLIANCE_VERSION=\"${VERSION}\""
+            echo "BUILD_TIME=\"$(date -u -Iseconds)\""
+            echo "GIT_SHA=\"${GITHUB_SHA}\""
+            echo "APPLIANCE_ARCH=\"${ARCH}\""
+            echo "APPLIANCE_PROFILE=\"${PROFILE}\""
+          } > appliance/mkosi.extra/etc/spatiumddi/appliance-release
+          cat appliance/mkosi.extra/etc/spatiumddi/appliance-release
+
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+
+      - name: Install helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
+
+      - name: Fetch k3s binary + airgap tarball
+        run: |
+          set -euo pipefail
+          chmod +x appliance/scripts/fetch-k3s.sh
+          ARCH=${ARCH} appliance/scripts/fetch-k3s.sh
+          file appliance/mkosi.extra/usr/local/bin/k3s
+          ls -lh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/k3s-airgap-images-*.tar.zst
+
+      - name: Bake helm charts (appliance + control + metallb)
+        run: |
+          set -euo pipefail
+          chmod +x appliance/scripts/bake-chart.sh
+          appliance/scripts/bake-chart.sh
+          CHART_NAME=spatiumddi appliance/scripts/bake-chart.sh
+          CHART_NAME=spatiumddi-metallb appliance/scripts/bake-chart.sh
+          ls -lh appliance/mkosi.extra/usr/lib/spatiumddi/charts/*.tgz
+
+      - name: Bake container images (ghcr.io/spatiumnorth:${{ env.VERSION }}, arm64)
+        env:
+          SPATIUMDDI_VERSION: ${{ env.VERSION }}
+          BAKE_SOURCE: ghcr
+          DOCKER_DEFAULT_PLATFORM: linux/arm64
+          BAKE_SAVE_PLATFORM: linux/arm64
+        run: |
+          set -euo pipefail
+          chmod +x appliance/scripts/bake-images.sh
+          # The spatiumnorth images are public; pulled anonymously.
+          sudo -E appliance/scripts/bake-images.sh
+          ls -lh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/*.tar.zst
+          du -sh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/
+
+      - name: Build the appliance builder from this tag
+        run: docker build -t spatiumddi-appliance-builder:local appliance/builder
+
+      - name: Build raw image (mkosi, --profile rpi5)
+        run: |
+          set -euo pipefail
+          mkdir -p appliance/build
+          docker run --rm --privileged \
+            -v "$PWD/appliance:/work" \
+            spatiumddi-appliance-builder:local \
+            --architecture=arm64 --profile "${PROFILE}" \
+            --output-directory=build --force build
+          ls -lh appliance/build/
+
+      - name: Verify kernel + extract the Pi 5 device tree
+        id: verify
+        run: |
+          set -euo pipefail
+          RAW=$(ls appliance/build/spatiumddi-appliance*.raw | head -1)
+          LOOP=$(sudo losetup -fP --show "$RAW")
+          trap 'sudo umount /mnt/root 2>/dev/null || true; sudo losetup -d "$LOOP" || true' EXIT
+          sudo mkdir -p /mnt/root
+          found=""
+          for p in "${LOOP}"p*; do
+            if sudo mount -o ro "$p" /mnt/root 2>/dev/null; then
+              if [ -d /mnt/root/lib/modules ] || [ -d /mnt/root/usr/lib/modules ]; then found="$p"; break; fi
+              sudo umount /mnt/root
+            fi
+          done
+          [ -n "$found" ] || { echo "::error::no root filesystem found in $RAW"; exit 1; }
+          KVER=$(ls /mnt/root/usr/lib/modules 2>/dev/null || ls /mnt/root/lib/modules)
+          echo "Kernel(s): $KVER"
+          echo "$KVER" | grep -q "rpi-2712" || { echo "::error::kernel is not the RPi 2712 kernel — rpi5 profile not applied"; exit 1; }
+          if dpkg-query --admindir=/mnt/root/var/lib/dpkg -W 'linux-image-arm64' >/dev/null 2>&1; then
+            echo "::error::generic linux-image-arm64 is installed alongside the RPi kernel"; exit 1
+          fi
+          grep -q 'APPLIANCE_PROFILE="rpi5"' /mnt/root/etc/spatiumddi/appliance-release \
+            || { echo "::error::appliance-release lacks APPLIANCE_PROFILE=rpi5"; exit 1; }
+          DTB=$(sudo find /mnt/root/usr/lib /mnt/root/boot -name 'bcm2712-rpi-5-b.dtb' 2>/dev/null | grep -F "$(echo "$KVER" | head -1)" | head -1 || true)
+          [ -n "$DTB" ] || DTB=$(sudo find /mnt/root/usr/lib /mnt/root/boot -name 'bcm2712-rpi-5-b.dtb' 2>/dev/null | head -1)
+          [ -n "$DTB" ] || { echo "::error::bcm2712-rpi-5-b.dtb not found in the image"; exit 1; }
+          echo "DTB: $DTB"
+          sudo cp "$DTB" "appliance/build/bcm2712-rpi-5-b-${VERSION}.dtb"
+          sudo chown "$(id -u)" "appliance/build/bcm2712-rpi-5-b-${VERSION}.dtb"
+          printf '%s\n' "$KVER" > "appliance/build/kernel-${VERSION}-rpi5.txt"
+          echo "kernel=$(echo "$KVER" | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Build slot-upgrade image (.raw.xz + sha256)
+        id: slot
+        run: |
+          set -euo pipefail
+          RAW=$(ls appliance/build/spatiumddi-appliance*.raw | head -1)
+          chmod +x appliance/scripts/build-slot-image.sh
+          docker run --rm --privileged \
+            --entrypoint /work/scripts/build-slot-image.sh \
+            -e APPLIANCE_ARCH="${ARCH}" \
+            -v "$PWD/appliance:/work" \
+            spatiumddi-appliance-builder:local \
+            "/work/build/$(basename "$RAW")" \
+            "/work/build"
+          SRC_XZ=$(ls appliance/build/spatiumddi-appliance-slot-*.raw.xz | head -1)
+          NAME="spatiumddi-appliance-slot-${VERSION}-${ARCH}-${PROFILE}"
+          mv "$SRC_XZ" "appliance/build/${NAME}.raw.xz"
+          rm -f "${SRC_XZ%.raw.xz}.sha256"
+          ( cd appliance/build && sha256sum "${NAME}.raw.xz" > "${NAME}.sha256" \
+            && sha256sum "bcm2712-rpi-5-b-${VERSION}.dtb" > "bcm2712-rpi-5-b-${VERSION}.dtb.sha256" )
+          ls -lh appliance/build/
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish as a pre-release in this fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="rpi5-${VERSION}"
+          N="${{ steps.slot.outputs.name }}"
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "SpatiumDDI ${VERSION} — Raspberry Pi 5 slot image (rpi5 profile)" \
+            --notes "Unofficial build of upstream ${VERSION} with the rpi5 mkosi profile (spatiumnorth/spatiumddi#1330) for a Raspberry Pi 5 booting EDK2 in Device Tree mode. Kernel: ${{ steps.verify.outputs.kernel }}. Apply with \`spatium-upgrade-slot apply <file> --checksum <file>.sha256\` or Fleet → Slot images. If the kernel differs from the one on the box, copy bcm2712-rpi-5-b-${VERSION}.dtb to the NVMe ESP as bcm2712-rpi-5-b.dtb." \
+            "appliance/build/${N}.raw.xz" \
+            "appliance/build/${N}.sha256" \
+            "appliance/build/bcm2712-rpi-5-b-${VERSION}.dtb" \
+            "appliance/build/bcm2712-rpi-5-b-${VERSION}.dtb.sha256" \
+            "appliance/build/kernel-${VERSION}-rpi5.txt"
