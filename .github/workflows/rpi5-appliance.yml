@@ -152,13 +152,16 @@ jobs:
           if echo "$IMGS" | grep -E -- '-arm64$' | grep -q .; then
             echo "::error::a generic arm64 kernel package is installed: $IMGS"; exit 1
           fi
-          # What GRUB actually boots.
-          VMLINUZ=$(readlink /mnt/root/boot/vmlinuz || true)
-          echo "/boot/vmlinuz -> $VMLINUZ"
-          echo "$VMLINUZ" | grep -q "rpi-2712" || { echo "::error::/boot/vmlinuz does not point at the RPi kernel"; exit 1; }
-          INITRD=$(readlink /mnt/root/boot/initrd.img || true)
-          echo "/boot/initrd.img -> $INITRD"
-          echo "$INITRD" | grep -q "rpi-2712" || { echo "::error::/boot/initrd.img does not point at the RPi initrd"; exit 1; }
+          # What GRUB will boot: mkosi strips /boot from the rootfs and emits the
+          # kernel as <raw>.vmlinuz; build-slot-image.sh installs THAT file as
+          # /boot/vmlinuz-<first dir in /lib/modules> and points the symlinks at
+          # it. So the kernel image itself must be the RPi one.
+          VMZ="${RAW%.raw}.vmlinuz"
+          [ -f "$VMZ" ] || { echo "::error::mkosi kernel output $VMZ missing"; exit 1; }
+          if gzip -t "$VMZ" 2>/dev/null; then KSTR=$(zcat "$VMZ" | strings | grep -m1 'Linux version' || true)
+          else KSTR=$(strings "$VMZ" | grep -m1 'Linux version' || true); fi
+          echo "kernel image: $KSTR"
+          echo "$KSTR" | grep -q "rpi-2712" || { echo "::error::mkosi kernel image is not the RPi 2712 kernel"; exit 1; }
           grep -q 'APPLIANCE_PROFILE="rpi5"' /mnt/root/etc/spatiumddi/appliance-release \
             || { echo "::error::appliance-release lacks APPLIANCE_PROFILE=rpi5"; exit 1; }
           DTB=$(sudo find /mnt/root/usr/lib /mnt/root/boot -name 'bcm2712-rpi-5-b.dtb' 2>/dev/null | grep -F "$(echo "$KVER" | head -1)" | head -1 || true)
